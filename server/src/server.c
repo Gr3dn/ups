@@ -51,6 +51,53 @@ void active_name_remove(const char* n) {
 }
 
 
+// /* Parsing the selection string: “C45<name><lobby>\n”
+//    Return: 0=OK (out_name and out_lobby are filled), -1=format/range error. */
+// static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, int* out_lobby) {
+//     if (!is_c45_prefix(line)) return -1;
+
+//     /* cut off “C45” and trailing \r\n and spaces */
+//     const char* s = line + 3;
+//     while (*s == ' ' || *s == '\t') s++;
+
+//     char tmp[READ_BUF];
+//     strncpy(tmp, s, sizeof(tmp)-1);
+//     tmp[sizeof(tmp)-1] = '\0';
+//     for (int i = (int)strlen(tmp)-1; i >=0 && (tmp[i]=='\r'||tmp[i]=='\n'||tmp[i]==' '||tmp[i]=='\t'); --i) {
+//         tmp[i] = '\0';
+//     }
+//     if (tmp[0] == '\0') return -2;
+
+//     /* remove the lobby number from the end */
+//     int len = (int)strlen(tmp);
+//     int pos = len - 1;
+//     if (pos < 0) return -3;
+
+//     /* collect lobby numbers in reverse order */
+//     int lobby = 0;
+//     int base = 1;
+//     int digits = 0;
+//     while (pos >= 0 && tmp[pos] >= '0' && tmp[pos] <= '9') {
+//         lobby = (tmp[pos] - '0') * base + lobby;
+//         base *= 10;
+//         digits++;
+//         pos--;
+//     }
+//     if (digits == 0) return -4; /* without a number */
+//     printf("%d", lobby);
+//     if (lobby < 1 || lobby > LOBBY_COUNT) return -5;
+
+//     /* name */
+//     while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) pos--;
+//     tmp[pos+1] = '\0'; /* cutting spaces */
+//     if (pos+1 <= 0) return -6;
+
+//     if ((int)strlen(tmp) >= out_name_sz) return -7;
+//     strcpy(out_name, tmp);
+//     *out_lobby = lobby;
+//     return 0;
+// }
+
 /* Parsing the selection string: “C45<name><lobby>\n”
    Return: 0=OK (out_name and out_lobby are filled), -1=format/range error. */
 static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, int* out_lobby) {
@@ -63,42 +110,42 @@ static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, i
     char tmp[READ_BUF];
     strncpy(tmp, s, sizeof(tmp)-1);
     tmp[sizeof(tmp)-1] = '\0';
-    for (int i = (int)strlen(tmp)-1; i >=0 && (tmp[i]=='\r'||tmp[i]=='\n'||tmp[i]==' '||tmp[i]=='\t'); --i) {
+
+    // убираем \r \n и пробелы с конца
+    for (int i = (int)strlen(tmp)-1; i >= 0 &&
+             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
         tmp[i] = '\0';
     }
     if (tmp[0] == '\0') return -2;
 
-    /* remove the lobby number from the end */
+    /* берем ТОЛЬКО последнюю цифру как номер лобби */
     int len = (int)strlen(tmp);
     int pos = len - 1;
     if (pos < 0) return -3;
 
-    /* collect lobby numbers in reverse order */
-    int lobby = 0;
-    int base = 1;
-    int digits = 0;
-    while (pos >= 0 && tmp[pos] >= '0' && tmp[pos] <= '9') {
-        lobby = (tmp[pos] - '0') * base + lobby;
-        base *= 10;
-        digits++;
+    // последняя значащая позиция должна быть цифрой
+    if (tmp[pos] < '0' || tmp[pos] > '9') return -4;  // нет цифры в конце
+
+    int lobby = tmp[pos] - '0';
+    tmp[pos] = '\0';          // отрезаем цифру лобби
+    pos--;
+
+    if (lobby < 1 || lobby > g_lobby_count) return -5;
+
+    /* теперь в tmp осталось только имя (с возможными пробелами в конце) */
+    while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) {
+        tmp[pos] = '\0';
         pos--;
     }
-    char last = tmp[len - 1];
-    if (last < '0' || last > '9') return -4;
-
-    lobby = last - '0';
-    if (lobby < 1 || lobby > LOBBY_COUNT) return -5;
-
-    /* name */
-    while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) pos--;
-    tmp[pos+1] = '\0'; /* cutting spaces */
-    if (pos+1 <= 0) return -6;
+    if (pos < 0) return -6;
 
     if ((int)strlen(tmp) >= out_name_sz) return -7;
+
     strcpy(out_name, tmp);
     *out_lobby = lobby;
     return 0;
 }
+
 
 /* Client stream */
 static void* client_thread(void* arg) {
@@ -267,7 +314,7 @@ static void* client_thread(void* arg) {
     return NULL;
 }
 
-int run_server(int port) {
+int run_server(const char* bind_ip, int port) {
     signal(SIGINT, on_sigint);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -279,7 +326,18 @@ int run_server(int port) {
     struct sockaddr_in addr = {0};
     addr.sin_family      = AF_INET;
     addr.sin_port        = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    
+    // Bind IP
+    if (!bind_ip || strcmp(bind_ip, "0.0.0.0") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else {
+        if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
+            fprintf(stderr, "Invalid bind IP: %s\n", bind_ip);
+            close(srv);
+            return 1;
+        }
+    }
+
 
     if (bind(srv, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(srv); return 1;
@@ -288,7 +346,7 @@ int run_server(int port) {
         perror("listen"); close(srv); return 1;
     }
 
-    printf("Server listening on port %d\n", port);
+    printf("Server listening on %s:%d\n", bind_ip, port);
     while (g_server_running) {
         struct sockaddr_in cli;
         socklen_t clen = sizeof(cli);

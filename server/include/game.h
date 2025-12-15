@@ -8,9 +8,12 @@
 #endif
 
 #define MAX_NAME_LEN 64
-#define LOBBY_COUNT 5
 #define LOBBY_SIZE  2
 #define DECK_SIZE   52
+
+// Server network config (loaded from config.txt)
+extern char g_server_ip[64];   // e.g. "0.0.0.0" or "192.168.1.106"
+extern int  g_server_port;     // 1..65535
 
 typedef enum { CLUBS, DIAMONDS, HEARTS, SPADES } Suit;
 
@@ -38,10 +41,18 @@ typedef struct {
 } Lobby;
 
 /* Global lobby pool and server flag */
-extern Lobby       g_lobbies[LOBBY_COUNT];
 extern atomic_int  g_server_running;
+// Dynamic lobby configuration
+extern int   g_lobby_count;
+extern Lobby *g_lobbies;
 
-void lobbies_init(void);
+// Loads config (LOBBY_COUNT) from file
+int  load_config(const char* filename);
+
+// Frees allocated lobbies
+void lobbies_free(void);
+
+int lobbies_init(void);
 int  hand_value(const Card* hand, int n);         // Ace 1/11
 int  start_game_if_ready(int lobby_index);
 int lobby_name_exists(const char* name);

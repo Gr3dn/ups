@@ -6,9 +6,14 @@
 #include <string.h>
 #include <time.h>
 
-Lobby      g_lobbies[LOBBY_COUNT];
+Lobby* g_lobbies = NULL;
+int    g_lobby_count = 5; // default value
 atomic_int g_server_running = 1;
 static void* lobby_game_thread(void* arg);
+
+// Server network config (definitions)
+char g_server_ip[64] = "0.0.0.0";
+int  g_server_port   = 10000;
 /* --------- Deck ---------- */
 void deck_init(Deck *d) {
     int idx = 0;
@@ -40,24 +45,65 @@ Card deck_draw(Deck *d) {
 }
 
 /* --------- Lobbies ---------- */
-void lobbies_init(void) {
+int load_config(const char* filename) {
+    FILE* f = fopen(filename, "r");
+    if (!f) {
+        // Config missing -> keep defaults
+        return 0;
+    }
+
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char key[64] = {0};
+        char val[128] = {0};
+
+        // key + value (value may be string or number)
+        if (sscanf(line, " %63s %127s", key, val) != 2) continue;
+
+        if (strcmp(key, "LOBBY_COUNT") == 0) {
+            int v = atoi(val);
+            if (v >= 1 && v <= 1000) g_lobby_count = v;
+        } else if (strcmp(key, "PORT") == 0) {
+            int p = atoi(val);
+            if (p >= 1 && p <= 65535) g_server_port = p;
+        } else if (strcmp(key, "IP") == 0) {
+            // Accept "0.0.0.0" to bind on all interfaces
+            strncpy(g_server_ip, val, sizeof(g_server_ip) - 1);
+            g_server_ip[sizeof(g_server_ip) - 1] = '\0';
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+
+int lobbies_init(void) {
     srand((unsigned)time(NULL));
-    for (int i = 0; i < LOBBY_COUNT; ++i) {
+
+    g_lobbies = (Lobby*)calloc((size_t)g_lobby_count, sizeof(Lobby));
+    if (!g_lobbies) return -1;
+
+    for (int i = 0; i < g_lobby_count; ++i) {
         g_lobbies[i].player_count = 0;
         g_lobbies[i].is_running   = 0;
         pthread_mutex_init(&g_lobbies[i].mtx, NULL);
+
         deck_init(&g_lobbies[i].deck);
         deck_shuffle(&g_lobbies[i].deck);
+
         for (int p = 0; p < LOBBY_SIZE; ++p) {
             g_lobbies[i].players[p].name[0] = '\0';
-            g_lobbies[i].players[p].hand_size = 0;
-            g_lobbies[i].players[p].connected = 0;
+            g_lobbies[i].players[p].fd = -1;
         }
     }
+
+    return 0;
 }
 
+
 int lobby_try_add_player(int lobby_index, const char* name) {
-    if (lobby_index < 0 || lobby_index >= LOBBY_COUNT) return -1;
+    if (lobby_index < 0 || lobby_index >= g_lobby_count) return -1;
 
     Lobby* L = &g_lobbies[lobby_index];
     pthread_mutex_lock(&L->mtx);
@@ -89,7 +135,7 @@ int lobby_try_add_player(int lobby_index, const char* name) {
 }
 
 void lobby_remove_player_by_name(const char* name) {
-    for (int i = 0; i < LOBBY_COUNT; ++i) {
+    for (int i = 0; i < g_lobby_count; ++i) {
         Lobby* L = &g_lobbies[i];
         pthread_mutex_lock(&L->mtx);
         for (int p = 0; p < LOBBY_SIZE; ++p) {
@@ -130,7 +176,7 @@ void card_to_str(Card c, char out[3]) {
 }
 
 int lobby_attach_fd(int li, const char* name, int fd) {
-    if (li < 0 || li >= LOBBY_COUNT) return -1;
+    if (li < 0 || li >= g_lobby_count) return -1;
     Lobby* L = &g_lobbies[li];
     pthread_mutex_lock(&L->mtx);
     for (int p = 0; p < LOBBY_SIZE; ++p) {
@@ -265,7 +311,7 @@ static void* lobby_game_thread(void* arg) {
 
 int lobby_name_exists(const char* name) {
     if (!name || !*name) return 0;
-    for (int i = 0; i < LOBBY_COUNT; ++i) {
+    for (int i = 0; i < g_lobby_count; ++i) {
         Lobby* L = &g_lobbies[i];
         pthread_mutex_lock(&L->mtx);
         for (int p = 0; p < LOBBY_SIZE; ++p) {
@@ -279,4 +325,15 @@ int lobby_name_exists(const char* name) {
         pthread_mutex_unlock(&L->mtx);
     }
     return 0;
+}
+
+void lobbies_free(void) {
+    if (!g_lobbies) return;
+
+    for (int i = 0; i < g_lobby_count; ++i) {
+        pthread_mutex_destroy(&g_lobbies[i].mtx);
+    }
+
+    free(g_lobbies);
+    g_lobbies = NULL;
 }

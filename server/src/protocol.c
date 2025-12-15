@@ -49,9 +49,11 @@ int is_c45_prefix(const char* s) {
 int send_lobbies_snapshot(int fd) {
     char line[128];
     sleep(2);
-    if (write_all(fd, "C45LOBBIES 5\n") < 0) return -1;
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "C45LOBBIES %d\n", g_lobby_count);
+    if (write_all(fd, hdr) < 0) return -1;
 
-    for (int i = 0; i < LOBBY_COUNT; ++i) {
+    for (int i = 0; i < g_lobby_count; ++i) {
         int players, status;
         pthread_mutex_lock(&g_lobbies[i].mtx);
         players = g_lobbies[i].player_count;
