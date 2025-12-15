@@ -1,0 +1,7 @@
+Manifest-Version: 1.0
+Archiver-Version: Plexus Archiver
+Created-By: Apache Maven 3.8.7
+Built-By: gr3dn
+Build-Jdk: 21.0.8
+Main-Class: com.blackjack.MainApp
+
