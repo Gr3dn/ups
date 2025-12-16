@@ -7,16 +7,23 @@ import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 public class NetClient {
-    private final Socket socket;
-    private final OutputStream os;
-    private final BufferedReader br;
+    private final String host;
+    private final int port;
+    private final int connectTimeoutMs;
+
+    private Socket socket;
+    private OutputStream os;
+    private BufferedReader br;
     private Thread reader;
     private volatile boolean closing = false;
+    private volatile String lastName = null;
+    private volatile int lastLobby = -1;
 
-    private NetClient(Socket s) throws IOException {
-        this.socket = s;
-        this.os = s.getOutputStream();
-        this.br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+    private NetClient(Socket s, String host, int port, int timeoutMs) throws IOException {
+        this.host = host;
+        this.port = port;
+        this.connectTimeoutMs = timeoutMs;
+        replaceConnection(s);
     }
 
     public static NetClient connect(String host, int port, int timeoutMs) throws IOException {
@@ -24,18 +31,39 @@ public class NetClient {
         s.connect(new InetSocketAddress(host, port), timeoutMs);
         // Do not auto-disconnect on long idle periods (lobby selection / after result).
         s.setSoTimeout(0);
-        return new NetClient(s);
+        return new NetClient(s, host, port, timeoutMs);
     }
 
     public void startReader(ProtocolListener l) {
         reader = new Thread(() -> {
-            try {
-                boolean okSeen = false;
-                while (true) {
+            boolean okSeen = false;
+            while (!closing) {
+                try {
                     String line = br.readLine();
                     if (line == null) throw new EOFException("server closed");
                     String t = line.trim();
                     if (t.isEmpty()) continue;
+
+                    if (t.startsWith("C45PING")) {
+                        try { sendPong(); } catch (IOException ignored) {}
+                        continue;
+                    }
+                    if (t.startsWith("C45RECONNECT_OK")) {
+                        continue;
+                    }
+                    if (t.startsWith("C45OPPDOWN")) {
+                        String[] p = t.split("\\s+");
+                        String who = (p.length >= 2) ? p[1] : "оппонент";
+                        String sec = (p.length >= 3) ? p[2] : "30";
+                        l.onResult(who + " отключился, ждём " + sec + " секунд…");
+                        continue;
+                    }
+                    if (t.startsWith("C45OPPBACK")) {
+                        String[] p = t.split("\\s+");
+                        String who = (p.length >= 2) ? p[1] : "оппонент";
+                        l.onResult(who + " вернулся, продолжаем игру.");
+                        continue;
+                    }
 
                     // C45LL... parsing
 //                    String framed = null;
@@ -116,12 +144,18 @@ public class NetClient {
                             l.onServerError("send C45YES failed: " + ioe.getMessage());
                         }
                     }
+                } catch (Exception ex) {
+                    if (closing) return;
+                    if (tryReconnect()) continue;
+                    System.out.println(ex);
+                    System.out.println("Trying read Bad line");
+                    if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
+                        l.onServerError("Не удалось восстановить соединение за 30 секунд. Переподключись вручную.");
+                    } else {
+                        l.onServerError(ex.getMessage());
+                    }
+                    return;
                 }
-            } catch (Exception ex) {
-                if (closing) return;
-                System.out.println(ex);
-                System.out.println("Trying read Bad line");
-                l.onServerError(ex.getMessage());
             }
         }, "net-reader");
         reader.setDaemon(true);
@@ -130,9 +164,14 @@ public class NetClient {
 
     // отправка команд
     public synchronized void sendRaw(String s) throws IOException { os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
-    public void sendName(String name) throws IOException { sendRaw("C45" + name + "\n"); }
+    public void sendName(String name) throws IOException {
+        lastName = name;
+        sendRaw("C45" + name + "\n");
+    }
     // Совместимо с твоим текущим форматом "C45<name><lobby>"
     public void sendJoin(String name, int lobby) throws IOException {
+        lastName = name;
+        lastLobby = lobby;
         sendRaw("C45" + name + lobby + "\n");
         System.out.println(lobby);
     }
@@ -140,6 +179,7 @@ public class NetClient {
     public void sendHit() throws IOException { sendRaw("C45HIT\n"); }
     public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
     public void sendYes() throws IOException { sendRaw("C45YES\n"); }
+    public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
     public void sendBackToLobby(String name) throws IOException { sendRaw("C45" + (name == null ? "" : name) + "back\n"); }
 
 //    public void sendName(String name) throws IOException { sendRaw(buildC45Frame(name)); }
@@ -154,6 +194,36 @@ public class NetClient {
         closing = true;
         try { socket.close(); } catch (Exception ignored) {}
         try { if (reader != null) reader.interrupt(); } catch (Exception ignored) {}
+    }
+
+    private synchronized void replaceConnection(Socket s) throws IOException {
+        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+        this.socket = s;
+        this.os = s.getOutputStream();
+        this.br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+    }
+
+    private boolean tryReconnect() {
+        String n = lastName;
+        int lobby = lastLobby;
+        if (n == null || n.isBlank() || lobby <= 0) return false;
+
+        long deadline = System.currentTimeMillis() + 30000L;
+        while (!closing && System.currentTimeMillis() < deadline) {
+            try {
+                Socket s = new Socket();
+                int to = Math.min(connectTimeoutMs, 3000);
+                s.connect(new InetSocketAddress(host, port), to);
+                s.setSoTimeout(0);
+                replaceConnection(s);
+                sendRaw("C45RECONNECT " + n + " " + lobby + "\n");
+                return true;
+            } catch (Exception ignored) {
+                try { Thread.sleep(500); } catch (InterruptedException ie) { break; }
+            }
+        }
+
+        return false;
     }
 
 
