@@ -315,7 +315,7 @@ static void* client_thread(void* arg) {
 }
 
 int run_server(const char* bind_ip, int port) {
-    signal(SIGINT, on_sigint);
+    signal(SIGINT, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
