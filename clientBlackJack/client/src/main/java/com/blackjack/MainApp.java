@@ -177,13 +177,7 @@ public class MainApp extends Application {
         VBox mid = new VBox(12, lbl, pi);
         mid.setAlignment(Pos.CENTER);
 
-        Button backBtn = new Button("Disconnect");
-        backBtn.setOnAction(e -> {
-            closeClient();
-            goToConnectScene("Connection closed.");
-        });
-
-        VBox root = new VBox(20, mid, backBtn);
+        VBox root = new VBox(20, mid);
         root.setPadding(new Insets(16));
         root.setAlignment(Pos.CENTER);
 
@@ -296,6 +290,7 @@ public class MainApp extends Application {
                     int ln = lastLobbySelected > 0 ? lastLobbySelected : 0;
                     gameView = new GameView(ln);
                     gameView.bindClient(client);
+                    gameView.setOnBackToLobby(() -> MainApp.this.requestBackToLobby());
                     primaryStage.setTitle("Blackjack Client — Game");
                     primaryStage.setScene(gameView.scene());
                 });
@@ -357,8 +352,25 @@ public class MainApp extends Application {
         int ln = lastLobbySelected > 0 ? lastLobbySelected : 0;
         gameView = new GameView(ln);
         gameView.bindClient(client);
+        gameView.setOnBackToLobby(() -> MainApp.this.requestBackToLobby());
         primaryStage.setTitle("Blackjack Client — Game");
         primaryStage.setScene(gameView.scene());
+    }
+
+    private void requestBackToLobby() {
+        Platform.runLater(() -> {
+            primaryStage.setTitle("Blackjack Client — Lobby");
+            primaryStage.setScene(buildLobbyWaitingScene());
+        });
+        new Thread(() -> {
+            try {
+                if (client == null) throw new SocketException("Connection broke");
+                client.sendBackToLobby(Objects.requireNonNullElse(name, ""));
+            } catch (Exception ex) {
+                String reason = normalizeNetError(ex);
+                goToConnectScene("Connection lost: " + reason);
+            }
+        }, "send-back-thread").start();
     }
 
     private void goToConnectScene(String message) {

@@ -301,8 +301,9 @@ static void* lobby_game_thread(void* arg) {
 
 
     for (int p = 0; p < LOBBY_SIZE; ++p) {
+        // Keep the name reserved until the client disconnects;
+        // just remove the player from the lobby after the game ends.
         char* n = L->players[p].name;
-        active_name_remove(n);
         lobby_remove_player_by_name(n);
     }
 

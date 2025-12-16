@@ -7,11 +7,16 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <poll.h>
+
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 int write_all(int fd, const char* s) {
     size_t n = strlen(s);
     size_t off = 0;
     while (off < n) {
-        ssize_t w = send(fd, s + off, n - off, 0);
+        ssize_t w = send(fd, s + off, n - off, MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) continue;
             return -1;

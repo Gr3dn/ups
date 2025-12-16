@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 #define ACTIVE_MAX 256
-// Reserving names among those connected but not yet in the lobby
+// Reserving names among all active connections (until disconnect)
 static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_active_names[ACTIVE_MAX][MAX_NAME_LEN];
 static int  g_active_cnt = 0;
@@ -146,6 +146,72 @@ static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, i
     return 0;
 }
 
+/* Parsing a client name line: "C45<name>\n"
+   Return: 0=OK, <0=error. */
+static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
+    if (!is_c45_prefix(line)) return -1;
+
+    const char* s = line + 3;
+    while (*s == ' ' || *s == '\t') s++;
+
+    char tmp[READ_BUF];
+    strncpy(tmp, s, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    for (int i = (int)strlen(tmp) - 1; i >= 0 &&
+             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
+        tmp[i] = '\0';
+    }
+    if (tmp[0] == '\0') return -2;
+    if ((int)strlen(tmp) >= out_name_sz) return -3;
+
+    strcpy(out_name, tmp);
+    return 0;
+}
+
+/* Checks "C45<name>back\n" for a specific expected name.
+   Return: 1=match, 0=not a back request, -1=back request with other name/bad. */
+static int is_back_request_for(const char* line, const char* expected_name) {
+    if (!is_c45_prefix(line)) return 0;
+    if (!expected_name || expected_name[0] == '\0') return 0;
+
+    const char* s = line + 3;
+    while (*s == ' ' || *s == '\t') s++;
+
+    char tmp[READ_BUF];
+    strncpy(tmp, s, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    for (int i = (int)strlen(tmp) - 1; i >= 0 &&
+             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
+        tmp[i] = '\0';
+    }
+
+    const char* suffix = "back";
+    size_t len = strlen(tmp);
+    size_t slen = strlen(suffix);
+    if (len <= slen) return 0;
+    if (strcmp(tmp + (len - slen), suffix) != 0) return 0;
+
+    tmp[len - slen] = '\0';
+    for (int i = (int)strlen(tmp) - 1; i >= 0 && (tmp[i] == ' ' || tmp[i] == '\t'); --i) {
+        tmp[i] = '\0';
+    }
+    if (tmp[0] == '\0') return -1;
+
+    return (strncmp(tmp, expected_name, MAX_NAME_LEN) == 0) ? 1 : -1;
+}
+
+static void wait_lobby_running_change(int lobby_index, int target_running) {
+    for (;;) {
+        pthread_mutex_lock(&g_lobbies[lobby_index].mtx);
+        int running = g_lobbies[lobby_index].is_running;
+        pthread_mutex_unlock(&g_lobbies[lobby_index].mtx);
+        if (!!running == !!target_running) return;
+        usleep(100000);
+    }
+}
+
 
 /* Client stream */
 static void* client_thread(void* arg) {
@@ -161,75 +227,44 @@ static void* client_thread(void* arg) {
 
     /* --- Handshake --- */
     int n = read_line(cfd, line, sizeof(line));
-    printf("n=%d, is_c45=%d\n",n,is_c45_prefix(line));
     if (n <= 0 || !is_c45_prefix(line)) {
         printf("[PROTO] Wrong handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
         write_all(cfd, "C45WRONG\n");
         close(cfd);
         return NULL;
     }
-    printf("[PROTO] Handshake OK from fd=%d: \"%s\"", cfd, line);
+    char name[MAX_NAME_LEN];
+    if (parse_name_only(line, name, sizeof(name)) != 0) {
+        printf("[PROTO] Bad name in handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
+        write_all(cfd, "C45WRONG\n");
+        close(cfd);
+        return NULL;
+    }
+    printf("[PROTO] Handshake OK '%s' from fd=%d\n", name, cfd);
+
+    // Reserve name for the whole lifetime of this connection
+    pthread_mutex_lock(&g_names_mtx);
+    int taken = active_name_has(name);
+    if (!taken) taken = (active_name_add(name) != 0);
+    pthread_mutex_unlock(&g_names_mtx);
+    if (taken) {
+        write_all(cfd, "C45WRONG NAME_TAKEN\n");
+        close(cfd);
+        return NULL;
+    }
+
+    // Acknowledge handshake for the Java client (its first OK)
+    if (write_all(cfd, "C45OK\n") < 0) {
+        pthread_mutex_lock(&g_names_mtx);
+        active_name_remove(name);
+        pthread_mutex_unlock(&g_names_mtx);
+        close(cfd);
+        return NULL;
+    }
 
     /* --- send a screenshot of the lobby --- */
     if (send_lobbies_snapshot(cfd) < 0) {
         printf("[ERR] Cannot send snapshot lobbies (fd=%d)\n", cfd);
-        close(cfd);
-        return NULL;
-    }
-
-    /* --- waiting for player selection: C45<name><lobby>\n --- */
-    n = read_line(cfd, line, sizeof(line));
-    if (n <= 0) {
-        printf("[NET] Client fd=%d closed before choise lobby\n", cfd);
-        close(cfd);
-        return NULL;
-    }
-    printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
-
-    char name[MAX_NAME_LEN];
-    int lobby_num = -1;
-    if (parse_name_lobby(line, name, sizeof(name), &lobby_num) != 0) {
-        printf("Error=%d", parse_name_lobby(line, name, sizeof(name), &lobby_num));
-        printf("[PROTO] Wrong format of choise -> C45WRONG (fd=%d)\n", cfd);
-        write_all(cfd, "C45WRONG\n");
-        close(cfd);
-        return NULL;
-    }
-
-    printf("[USER] Player '%s' ask for lobby #%d (fd=%d)\n", name, lobby_num, cfd);
-//========================================Name Control========================================
-    // Is the name already reserved by another connection?
-    pthread_mutex_lock(&g_names_mtx);
-    int taken = active_name_has(name);
-    pthread_mutex_unlock(&g_names_mtx);
-    if (taken) {
-        write_all(cfd, "C45WRONG NAME_TAKEN\n");
-        
-        close(cfd);
-        printf("prvni vychod");
-        return NULL;
-    } else {
-        pthread_mutex_lock(&g_names_mtx);
-        active_name_add(name);
-        pthread_mutex_unlock(&g_names_mtx);
-    }
-    
-
-
-    if (write_all(cfd, "C45OK\n") < 0) {
-        printf("[ERR] Cannot send C45OK to (fd=%d)\n", cfd);
-        pthread_mutex_lock(&g_names_mtx);
-        active_name_remove(name);
-        pthread_mutex_unlock(&g_names_mtx);
-        close(cfd);
-        return NULL;
-    }
-//========================================End========================================
-    /* --- Attempting to add to the selected lobby --- */
-    if (lobby_try_add_player(lobby_num - 1, name) != 0) {
-        write_all(cfd, "C45WRONG\n");
-        printf("[LOBBY] Cannot take from '%s' — Lobby #%d status full (fd=%d)\n", name, lobby_num, cfd);
-
         pthread_mutex_lock(&g_names_mtx);
         active_name_remove(name);
         pthread_mutex_unlock(&g_names_mtx);
@@ -237,85 +272,126 @@ static void* client_thread(void* arg) {
         return NULL;
     }
 
-    if (write_all(cfd, "C45OK\n") < 0) {
-        printf("[ERR] Cannot send C45OK after adding (fd=%d)\n", cfd);
-        lobby_remove_player_by_name(name);
-
-        pthread_mutex_lock(&g_names_mtx);
-        active_name_remove(name);
-        pthread_mutex_unlock(&g_names_mtx);
-        close(cfd);
-        return NULL;
-    }
-
-    printf("[PROTO] -> C45OK '%s' in Lobby #%d (fd=%d)\n", name, lobby_num, cfd);
-
-    lobby_attach_fd(lobby_num - 1, name, cfd);
-
-    start_game_if_ready(lobby_num - 1);
-
-    printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
-    int no_reply = 0;
-    const int NOREPLY_KILL = 5;
     for (;;) {
-        pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
-        int cnt = g_lobbies[lobby_num - 1].player_count;
-        int running = g_lobbies[lobby_num - 1].is_running;
-        pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
+        /* --- waiting for player selection: C45<name><lobby>\n --- */
+        int lobby_num = -1;
+        for (;;) {
+            n = read_line(cfd, line, sizeof(line));
+            if (n <= 0) {
+                printf("[NET] Client fd=%d closed before lobby choise\n", cfd);
+                goto disconnect;
+            }
+            printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
 
-        if (running || cnt >= LOBBY_SIZE) {
-            printf("[WAIT] Lobby #%d is full (%d/%d) — starting a game\n",
-                   lobby_num, cnt, LOBBY_SIZE);
+            int br = is_back_request_for(line, name);
+            if (br == 1) {
+                // Allow requesting the snapshot at any time outside the game loop
+                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+                continue;
+            } else if (br < 0) {
+                write_all(cfd, "C45WRONG\n");
+                continue;
+            }
+
+            char join_name[MAX_NAME_LEN];
+            if (parse_name_lobby(line, join_name, sizeof(join_name), &lobby_num) != 0) {
+                printf("[PROTO] Wrong format of choise -> C45WRONG (fd=%d)\n", cfd);
+                write_all(cfd, "C45WRONG\n");
+                continue;
+            }
+            if (strncmp(join_name, name, MAX_NAME_LEN) != 0) {
+                printf("[PROTO] Join name mismatch '%s' != '%s' (fd=%d)\n", join_name, name, cfd);
+                write_all(cfd, "C45WRONG\n");
+                continue;
+            }
             break;
         }
 
-        // Is the customer still on the stream?
-        if (write_all(cfd, "C45WAITING\n") < 0) {
-            printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
+        printf("[USER] Player '%s' ask for lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+
+        /* --- Attempting to add to the selected lobby --- */
+        if (lobby_try_add_player(lobby_num - 1, name) != 0) {
+            write_all(cfd, "C45WRONG\n");
+            printf("[LOBBY] Cannot take from '%s' — Lobby #%d status full (fd=%d)\n", name, lobby_num, cfd);
+            // stay connected and allow choosing another lobby
+            continue;
+        }
+        lobby_attach_fd(lobby_num - 1, name, cfd);
+
+        // Join OK for the Java client (its subsequent OKs)
+        if (write_all(cfd, "C45OK\n") < 0) {
+            printf("[ERR] Cannot send C45OK after adding (fd=%d)\n", cfd);
             lobby_remove_player_by_name(name);
-
-            pthread_mutex_lock(&g_names_mtx);
-            active_name_remove(name);
-            pthread_mutex_unlock(&g_names_mtx);
-            close(cfd);
-            return NULL;
+            goto disconnect;
         }
 
-        /* waiting "C45YES\n" */
-        int r = read_line(cfd, line, sizeof(line));
-        if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            if (++no_reply >= NOREPLY_KILL) {
-                printf("[WAIT] '%s' Cannot answer on ping - disconnect\n", name);
-                lobby_remove_player_by_name(name);
-                pthread_mutex_lock(&g_names_mtx);
-                active_name_remove(name);
-                pthread_mutex_unlock(&g_names_mtx);
-                close(cfd);
-                return NULL;
-            }
-        }else {
-            if (strncmp(line, "C45YES", 6) == 0) {
-                no_reply = 0;
-            }
-            else{
-                printf("[WAIT] '%s' Cannot answer on ping - disconnect\n", name);
-                lobby_remove_player_by_name(name);
-                pthread_mutex_lock(&g_names_mtx);
-                active_name_remove(name);
-                pthread_mutex_unlock(&g_names_mtx);
-                close(cfd);
-                return NULL;
-            }
-        }
-        
+        printf("[PROTO] -> C45OK '%s' in Lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+        start_game_if_ready(lobby_num - 1);
 
+        printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+
+        // wait until the game actually starts (or client cancels/disconnects)
+        for (;;) {
+            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
+            int running = g_lobbies[lobby_num - 1].is_running;
+            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
+            if (running) break;
+
+            if (write_all(cfd, "C45WAITING\n") < 0) {
+                printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
+                lobby_remove_player_by_name(name);
+                goto disconnect;
+            }
+
+            int r = read_line(cfd, line, sizeof(line));
+            if (r <= 0) {
+                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+                lobby_remove_player_by_name(name);
+                goto disconnect;
+            }
+            if (strncmp(line, "C45YES", 6) == 0) continue;
+
+            int br = is_back_request_for(line, name);
+            if (br == 1) {
+                // Cancel waiting: remove from lobby and return to lobby selection
+                lobby_remove_player_by_name(name);
+                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+                goto next_round;
+            }
+            // ignore unexpected lines while waiting
+        }
+
+        printf("[GAME] '%s' Game started in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+        wait_lobby_running_change(lobby_num - 1, 0); // wait game end
+        // Ensure the player has been removed from the lobby by the game thread
+        while (lobby_name_exists(name)) usleep(10000);
+
+        printf("[GAME] '%s' Game finished, waiting for '%sback' (fd=%d)\n", name, name, cfd);
+        for (;;) {
+            n = read_line(cfd, line, sizeof(line));
+            if (n <= 0) goto disconnect;
+            int br = is_back_request_for(line, name);
+            if (br == 1) break;
+            if (br < 0) write_all(cfd, "C45WRONG\n");
+        }
+
+        if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+
+next_round:
+        continue;
     }
-    printf("proverka");
+
+disconnect:
+    pthread_mutex_lock(&g_names_mtx);
+    active_name_remove(name);
+    pthread_mutex_unlock(&g_names_mtx);
+    close(cfd);
     return NULL;
 }
 
 int run_server(const char* bind_ip, int port) {
     signal(SIGINT, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }

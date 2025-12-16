@@ -11,6 +11,7 @@ public class NetClient {
     private final OutputStream os;
     private final BufferedReader br;
     private Thread reader;
+    private volatile boolean closing = false;
 
     private NetClient(Socket s) throws IOException {
         this.socket = s;
@@ -21,7 +22,8 @@ public class NetClient {
     public static NetClient connect(String host, int port, int timeoutMs) throws IOException {
         Socket s = new Socket();
         s.connect(new InetSocketAddress(host, port), timeoutMs);
-        s.setSoTimeout(30000);
+        // Do not auto-disconnect on long idle periods (lobby selection / after result).
+        s.setSoTimeout(0);
         return new NetClient(s);
     }
 
@@ -116,6 +118,7 @@ public class NetClient {
                     }
                 }
             } catch (Exception ex) {
+                if (closing) return;
                 System.out.println(ex);
                 System.out.println("Trying read Bad line");
                 l.onServerError(ex.getMessage());
@@ -137,6 +140,7 @@ public class NetClient {
     public void sendHit() throws IOException { sendRaw("C45HIT\n"); }
     public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
     public void sendYes() throws IOException { sendRaw("C45YES\n"); }
+    public void sendBackToLobby(String name) throws IOException { sendRaw("C45" + (name == null ? "" : name) + "back\n"); }
 
 //    public void sendName(String name) throws IOException { sendRaw(buildC45Frame(name)); }
 //    // "C45<name><lobby>" как и было — но в payload
@@ -146,9 +150,10 @@ public class NetClient {
 //    public void sendYes() throws IOException { sendRaw(buildC45Frame("YES")); }
 
     public void closeQuietly() {
-        try { br.close(); } catch (Exception ignored) {}
-        try { os.close(); } catch (Exception ignored) {}
+        // Close socket first to unblock reader thread; closing BufferedReader can block on its internal lock.
+        closing = true;
         try { socket.close(); } catch (Exception ignored) {}
+        try { if (reader != null) reader.interrupt(); } catch (Exception ignored) {}
     }
 
 
