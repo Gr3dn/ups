@@ -6,6 +6,9 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/socket.h>
 
 #define TURN_TIMEOUT_SEC       30
 #define RECONNECT_TIMEOUT_SEC  30
@@ -367,19 +370,61 @@ static void* lobby_game_thread(void* arg) {
         time_t last_ping = 0;
         time_t last_pong = time(NULL);
 
-        for (;;) {
-            time_t now = time(NULL);
+	        for (;;) {
+	            time_t now = time(NULL);
 
-            pthread_mutex_lock(&L->mtx);
-            int pfd = L->players[turn].fd;
-            pthread_mutex_unlock(&L->mtx);
+	            pthread_mutex_lock(&L->mtx);
+	            int pfd = L->players[turn].fd;
+	            int other_idx = 1 - turn;
+	            int other_fd = L->players[other_idx].fd;
+	            pthread_mutex_unlock(&L->mtx);
 
-            if (pfd < 0) goto pause_turn;
+	            if (pfd < 0) goto pause_turn;
 
-            // Keep only the current player alive (we read only from pfd).
-            // Pinging the other player would make them send PONGs that we won't read,
-            // which can eventually block their client writer thread.
-            if (now - last_ping >= PING_INTERVAL_SEC) {
+	            // If the other player disconnects during this turn, pause immediately and wait for reconnect.
+	            if (other_fd >= 0) {
+	                struct pollfd op = { .fd = other_fd, .events = POLLIN | POLLHUP | POLLERR };
+	                int pr = poll(&op, 1, 0);
+	                if (pr > 0) {
+	                    if (op.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+	                        if (other_idx == p0) goto pause_a;
+	                        else goto pause_b;
+	                    }
+	                    if (op.revents & POLLIN) {
+	                        char peek;
+	                        ssize_t rr = recv(other_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
+	                        if (rr == 0) {
+	                            if (other_idx == p0) goto pause_a;
+	                            else goto pause_b;
+	                        }
+	                        if (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+	                            if (other_idx == p0) goto pause_a;
+	                            else goto pause_b;
+	                        }
+	                        // Drain any unexpected input from the non-active player (prevents queueing).
+	                        for (;;) {
+	                            char dump[256];
+	                            ssize_t dr = recv(other_fd, dump, sizeof(dump), MSG_DONTWAIT);
+	                            if (dr > 0) continue;
+	                            if (dr == 0) {
+	                                if (other_idx == p0) goto pause_a;
+	                                else goto pause_b;
+	                            }
+	                            if (dr < 0) {
+	                                if (errno == EINTR) continue;
+	                                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+	                                if (other_idx == p0) goto pause_a;
+	                                else goto pause_b;
+	                            }
+	                        }
+	                    }
+	                }
+	            }
+
+	            // Keep only the current player alive (we read only from pfd).
+	            // Pinging the other player would make them send PONGs that we won't read,
+	            // which can eventually block their client writer thread.
+	            if (now - last_ping >= PING_INTERVAL_SEC) {
                 if (write_all(pfd, "C45PING\n") < 0) goto pause_turn;
                 last_ping = now;
             }
