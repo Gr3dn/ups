@@ -321,8 +321,9 @@ static void* lobby_game_thread(void* arg) {
         L->players[p].stood = 0;    
         L->players[p].busted = 0;
     }
-    int p0 = rand() % 2;
-    int p1 = 1 - p0;
+    // Step-by-step: player #1 (slot 0) goes first, then player #2 (slot 1).
+    int p0 = 0;
+    int p1 = 1;
     Player *A = &L->players[p0], *B = &L->players[p1];
 
     // deals 2 cards
@@ -337,19 +338,25 @@ static void* lobby_game_thread(void* arg) {
     snprintf(line, sizeof(line), "C45DEAL %s %s\n", c1, c2); write_all(B->fd, line);
     pthread_mutex_unlock(&L->mtx);
 
-    int turn = p0; // hit for player 0
+    int turn = 0; // player #1 starts
     for (;;) {
-turn_loop:
-        pthread_mutex_lock(&L->mtx);
-        if ((A->stood || A->busted) && (B->stood || B->busted)) {
-            pthread_mutex_unlock(&L->mtx);
-            break;
-        }
-        char turn_name[MAX_NAME_LEN];
-        strncpy(turn_name, L->players[turn].name, sizeof(turn_name) - 1);
-        turn_name[sizeof(turn_name) - 1] = '\0';
-        int fdA = A->fd;
-        int fdB = B->fd;
+	turn_loop:
+	        pthread_mutex_lock(&L->mtx);
+	        if ((A->stood || A->busted) && (B->stood || B->busted)) {
+	            pthread_mutex_unlock(&L->mtx);
+	            break;
+	        }
+	        // Skip players that already ended their round (stood/busted).
+	        if (L->players[turn].stood || L->players[turn].busted) {
+	            turn = 1 - turn;
+	            pthread_mutex_unlock(&L->mtx);
+	            continue;
+	        }
+	        char turn_name[MAX_NAME_LEN];
+	        strncpy(turn_name, L->players[turn].name, sizeof(turn_name) - 1);
+	        turn_name[sizeof(turn_name) - 1] = '\0';
+	        int fdA = A->fd;
+	        int fdB = B->fd;
         pthread_mutex_unlock(&L->mtx);
 
         snprintf(line, sizeof(line), "C45TURN %s %d\n", turn_name, TURN_TIMEOUT_SEC);
@@ -363,18 +370,19 @@ turn_loop:
         for (;;) {
             time_t now = time(NULL);
 
-            // keep both clients alive (and detect a hard disconnect via send error)
-            if (now - last_ping >= PING_INTERVAL_SEC) {
-                if (fdA >= 0 && write_all(fdA, "C45PING\n") < 0) goto pause_a;
-                if (fdB >= 0 && write_all(fdB, "C45PING\n") < 0) goto pause_b;
-                last_ping = now;
-            }
-
             pthread_mutex_lock(&L->mtx);
             int pfd = L->players[turn].fd;
             pthread_mutex_unlock(&L->mtx);
 
             if (pfd < 0) goto pause_turn;
+
+            // Keep only the current player alive (we read only from pfd).
+            // Pinging the other player would make them send PONGs that we won't read,
+            // which can eventually block their client writer thread.
+            if (now - last_ping >= PING_INTERVAL_SEC) {
+                if (write_all(pfd, "C45PING\n") < 0) goto pause_turn;
+                last_ping = now;
+            }
 
             char buf[READ_BUF];
             int r = read_line_timeout(pfd, buf, sizeof(buf), 1);
@@ -394,24 +402,24 @@ turn_loop:
             pthread_mutex_unlock(&L->mtx);
             char msg[32]; snprintf(msg, sizeof(msg), "C45CARD %s\n", cs);
             if (write_all(pfd, msg) < 0) goto pause_turn;
-            // check for overhand
-            pthread_mutex_lock(&L->mtx);
-            int v = hand_value(P->hand, P->hand_size);
-            if (v > 21) {
-                P->busted = 1;
-                pthread_mutex_unlock(&L->mtx);
-                snprintf(line, sizeof(line), "C45BUST %s %d\n", P->name, v);
-                if (fdA >= 0 && write_all(fdA, line) < 0) goto pause_a;
-                if (fdB >= 0 && write_all(fdB, line) < 0) goto pause_b;
-                turn = 1 - turn;
-            } else {
-                pthread_mutex_unlock(&L->mtx);
-            }
-            // restart the turn timer (the outer loop re-sends C45TURN)
-            break;
-            } else if (strncmp(buf, "C45STAND", 8) == 0) {
-                pthread_mutex_lock(&L->mtx);
-                L->players[turn].stood = 1;
+	            // check for overhand
+	            pthread_mutex_lock(&L->mtx);
+	            int v = hand_value(P->hand, P->hand_size);
+	            if (v > 21) {
+	                P->busted = 1;
+	                pthread_mutex_unlock(&L->mtx);
+	                snprintf(line, sizeof(line), "C45BUST %s %d\n", P->name, v);
+	                if (fdA >= 0 && write_all(fdA, line) < 0) goto pause_a;
+	                if (fdB >= 0 && write_all(fdB, line) < 0) goto pause_b;
+	            } else {
+	                pthread_mutex_unlock(&L->mtx);
+	            }
+	            // Step-by-step: after HIT (bust or not) the turn goes to the other player.
+	            turn = 1 - turn;
+	            break;
+	            } else if (strncmp(buf, "C45STAND", 8) == 0) {
+	                pthread_mutex_lock(&L->mtx);
+	                L->players[turn].stood = 1;
                 pthread_mutex_unlock(&L->mtx);
                 turn = 1 - turn;
                 break;
@@ -471,16 +479,22 @@ end_game:
     pthread_mutex_lock(&L->mtx);
     int va = A->busted ? -1 : hand_value(A->hand, A->hand_size);
     int vb = B->busted ? -1 : hand_value(B->hand, B->hand_size);
-    const char* winner = "PUSH";
-    if (forced_winner_idx == p0) winner = A->name;
-    else if (forced_winner_idx == p1) winner = B->name;
-    else if (va > vb) winner = A->name;
-    else if (vb > va) winner = B->name;
+    char winner_name[MAX_NAME_LEN];
+    if (forced_winner_idx == p0) strncpy(winner_name, A->name, sizeof(winner_name) - 1);
+    else if (forced_winner_idx == p1) strncpy(winner_name, B->name, sizeof(winner_name) - 1);
+    else if (va > vb) strncpy(winner_name, A->name, sizeof(winner_name) - 1);
+    else if (vb > va) strncpy(winner_name, B->name, sizeof(winner_name) - 1);
+    else strncpy(winner_name, "PUSH", sizeof(winner_name) - 1);
+    winner_name[sizeof(winner_name) - 1] = '\0';
     pthread_mutex_unlock(&L->mtx);
 
-    char res[128];
-    snprintf(res, sizeof(res), "C45RESULT %s %d %s %d WINNER %s\n",
-             A->name, va, B->name, vb, winner);
+    char res[256];
+    int res_len = snprintf(res, sizeof(res), "C45RESULT %s %d %s %d WINNER %s\n",
+                           A->name, va, B->name, vb, winner_name);
+    if (res_len < 0 || (size_t)res_len >= sizeof(res)) {
+        snprintf(res, sizeof(res), "C45RESULT %s %d %s %d WINNER %s\n",
+                 "?", va, "?", vb, "PUSH");
+    }
     if (A->fd >= 0) write_all(A->fd, res);
     if (B->fd >= 0) write_all(B->fd, res);
 

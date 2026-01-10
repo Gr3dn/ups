@@ -290,6 +290,7 @@ public class MainApp extends Application {
                     int ln = lastLobbySelected > 0 ? lastLobbySelected : 0;
                     gameView = new GameView(ln);
                     gameView.bindClient(client);
+                    gameView.setMyName(name);
                     gameView.setOnBackToLobby(() -> MainApp.this.requestBackToLobby());
                     primaryStage.setTitle("Blackjack Client — Game");
                     primaryStage.setScene(gameView.scene());
@@ -352,6 +353,7 @@ public class MainApp extends Application {
         int ln = lastLobbySelected > 0 ? lastLobbySelected : 0;
         gameView = new GameView(ln);
         gameView.bindClient(client);
+        gameView.setMyName(name);
         gameView.setOnBackToLobby(() -> MainApp.this.requestBackToLobby());
         primaryStage.setTitle("Blackjack Client — Game");
         primaryStage.setScene(gameView.scene());

@@ -470,7 +470,7 @@ disconnect:
 }
 
 int run_server(const char* bind_ip, int port) {
-    signal(SIGINT, SIG_IGN);
+    signal(SIGINT, on_sigint);
     signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);

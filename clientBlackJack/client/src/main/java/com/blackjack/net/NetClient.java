@@ -53,15 +53,15 @@ public class NetClient {
                     }
                     if (t.startsWith("C45OPPDOWN")) {
                         String[] p = t.split("\\s+");
-                        String who = (p.length >= 2) ? p[1] : "оппонент";
+                        String who = (p.length >= 2) ? p[1] : "Enemy";
                         String sec = (p.length >= 3) ? p[2] : "30";
-                        l.onResult(who + " отключился, ждём " + sec + " секунд…");
+                        l.onResult(who + " disconected, waiting " + sec + " seconds…");
                         continue;
                     }
                     if (t.startsWith("C45OPPBACK")) {
                         String[] p = t.split("\\s+");
-                        String who = (p.length >= 2) ? p[1] : "оппонент";
-                        l.onResult(who + " вернулся, продолжаем игру.");
+                        String who = (p.length >= 2) ? p[1] : "Enemy";
+                        l.onResult(who + " comeback, continue the game.");
                         continue;
                     }
 
@@ -129,8 +129,11 @@ public class NetClient {
                         String score2 = parts[3];
                         String winner = parts[5];
 
+                        String header = winner.equalsIgnoreCase("PUSH")
+                                ? "Draw. Nobody won."
+                                : "Winner: " + winner;
                         String result =
-                                "WINNER " + winner + "\n" +
+                                header + "\n" +
                                         p1 + ": " + score1 + "\n" +
                                         p2 + ": " + score2;
 
@@ -150,7 +153,7 @@ public class NetClient {
                     System.out.println(ex);
                     System.out.println("Trying read Bad line");
                     if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
-                        l.onServerError("Не удалось восстановить соединение за 30 секунд. Переподключись вручную.");
+                        l.onServerError("Unable to restore connection within 30 seconds. Please reconnect manually.");
                     } else {
                         l.onServerError(ex.getMessage());
                     }
