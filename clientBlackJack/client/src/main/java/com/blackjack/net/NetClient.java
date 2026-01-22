@@ -51,7 +51,6 @@ public class NetClient {
 
     public void startReader(ProtocolListener l) {
         reader = new Thread(() -> {
-            boolean okSeen = false;
             while (!closing) {
                 try {
                     String line = br.readLine();
@@ -65,6 +64,10 @@ public class NetClient {
                         continue;
                     }
                     if (t.startsWith("C45RECONNECT_OK")) {
+                        // We are back on the server. It can either resume the game (hand snapshot)
+                        // or (if the game already ended) send a normal lobby snapshot.
+                        state = State.LOBBY_WAIT_OR_GAME;
+                        expectLobbySnapshot = true;
                         continue;
                     }
                     if (t.startsWith("C45OPPDOWN")) {
@@ -98,16 +101,17 @@ public class NetClient {
 
                     // базовые токены
                     if (t.startsWith("C45OK")) {
-                        if (!okSeen) {
-                            okSeen = true;
+                        if (state == State.WAIT_OK) {
                             ensureState(t, State.WAIT_OK);
                             state = State.WAIT_LOBBIES;
                             expectLobbySnapshot = true;
                             l.onOk();
-                        } else {
+                        } else if (state == State.LOBBY_CHOICE) {
                             ensureState(t, State.LOBBY_CHOICE);
                             state = State.LOBBY_WAIT_OR_GAME;
                             l.onLobbyJoinOk();
+                        } else {
+                            throw new ProtocolException("Unexpected C45OK in state " + state + ": " + t);
                         }
                         continue;
                     }
@@ -290,6 +294,10 @@ public class NetClient {
         String n = lastName;
         int lobby = lastLobby;
         if (n == null || n.isBlank() || lobby <= 0) return false;
+
+        // After reconnect we can either land back in the running game OR be redirected to lobby list.
+        state = State.WAIT_OK;
+        expectLobbySnapshot = true;
 
         long deadline = System.currentTimeMillis() + 30000L;
         while (!closing && System.currentTimeMillis() < deadline) {

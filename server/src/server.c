@@ -25,6 +25,8 @@ static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_active_names[ACTIVE_MAX][MAX_NAME_LEN];
 static int  g_active_fds[ACTIVE_MAX];
 static int  g_active_back_req[ACTIVE_MAX];
+static unsigned long long g_active_tokens[ACTIVE_MAX];
+static unsigned long long g_token_seq = 1;
 static int  g_active_cnt = 0;
 
 /* --- Help --- */
@@ -44,6 +46,7 @@ int active_name_add(const char* n) {
     g_active_names[g_active_cnt-1][MAX_NAME_LEN-1] = '\0';
     g_active_fds[g_active_cnt-1] = -1;
     g_active_back_req[g_active_cnt-1] = 0;
+    g_active_tokens[g_active_cnt-1] = 0;
     return 0;
 }
 void active_name_remove(const char* n) {
@@ -54,8 +57,10 @@ void active_name_remove(const char* n) {
                 memcpy(g_active_names[i], g_active_names[g_active_cnt-1], MAX_NAME_LEN);
                 g_active_fds[i] = g_active_fds[g_active_cnt-1];
                 g_active_back_req[i] = g_active_back_req[g_active_cnt-1];
+                g_active_tokens[i] = g_active_tokens[g_active_cnt-1];
             }
             g_active_back_req[g_active_cnt-1] = 0;
+            g_active_tokens[g_active_cnt-1] = 0;
             g_active_cnt--;
             return;
         }
@@ -69,15 +74,20 @@ static int active_name_find(const char* n) {
     return -1;
 }
 
-static void active_name_set_fd(const char* n, int fd) {
+static unsigned long long active_name_set_fd(const char* n, int fd) {
     int i = active_name_find(n);
-    if (i >= 0) g_active_fds[i] = fd;
+    if (i >= 0) {
+        g_active_fds[i] = fd;
+        g_active_tokens[i] = g_token_seq++;
+        return g_active_tokens[i];
+    }
+    return 0;
 }
 
-static void active_name_remove_if_fd(const char* n, int fd) {
+static void active_name_remove_if_token(const char* n, unsigned long long token) {
     int i = active_name_find(n);
     if (i < 0) return;
-    if (g_active_fds[i] != fd) return;
+    if (g_active_tokens[i] != token) return;
     active_name_remove(n);
 }
 
@@ -310,6 +320,7 @@ static void* client_thread(void* arg) {
     char line[READ_BUF];
     char name[MAX_NAME_LEN] = {0};
     int lobby_num = -1;
+    unsigned long long my_token = 0;
 
     /* --- Handshake --- */
     int n = read_line(cfd, line, sizeof(line));
@@ -328,8 +339,29 @@ static void* client_thread(void* arg) {
             close(cfd);
             return NULL;
         }
-        if (lobby_try_reconnect(lobby_num - 1, name, cfd) != 0) {
-            write_all(cfd, "C45WRONG RECONNECT\n");
+
+        if (lobby_try_reconnect(lobby_num - 1, name, cfd) == 0) {
+            pthread_mutex_lock(&g_names_mtx);
+            if (!active_name_has(name)) {
+                if (active_name_add(name) != 0) {
+                    pthread_mutex_unlock(&g_names_mtx);
+                    write_all(cfd, "C45WRONG RECONNECT\n");
+                    close(cfd);
+                    return NULL;
+                }
+            }
+            my_token = active_name_set_fd(name, cfd);
+            pthread_mutex_unlock(&g_names_mtx);
+
+            write_all(cfd, "C45RECONNECT_OK\n");
+            printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+            goto game_wait;
+        }
+
+        // If reconnection is impossible (game already finished) treat it as a normal login
+        // and immediately send the lobby snapshot instead of disconnecting the client.
+        if (lobby_name_exists(name)) {
+            write_all(cfd, "C45WRONG NAME_TAKEN\n");
             close(cfd);
             return NULL;
         }
@@ -338,17 +370,32 @@ static void* client_thread(void* arg) {
         if (!active_name_has(name)) {
             if (active_name_add(name) != 0) {
                 pthread_mutex_unlock(&g_names_mtx);
-                write_all(cfd, "C45WRONG RECONNECT\n");
+                write_all(cfd, "C45WRONG\n");
                 close(cfd);
                 return NULL;
             }
         }
-        active_name_set_fd(name, cfd);
+        my_token = active_name_set_fd(name, cfd);
         pthread_mutex_unlock(&g_names_mtx);
 
-        write_all(cfd, "C45RECONNECT_OK\n");
-        printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
-        goto game_wait;
+        if (write_all(cfd, "C45OK\n") < 0) {
+            pthread_mutex_lock(&g_names_mtx);
+            active_name_remove_if_token(name, my_token);
+            pthread_mutex_unlock(&g_names_mtx);
+            close(cfd);
+            return NULL;
+        }
+        if (send_lobbies_snapshot(cfd) < 0) {
+            printf("[ERR] Cannot send snapshot lobbies (fd=%d)\n", cfd);
+            pthread_mutex_lock(&g_names_mtx);
+            active_name_remove_if_token(name, my_token);
+            pthread_mutex_unlock(&g_names_mtx);
+            close(cfd);
+            return NULL;
+        }
+
+        printf("[NET] Reconnect fallback -> lobby list for '%s' (fd=%d)\n", name, cfd);
+        goto lobby_select;
     }
 
     if (parse_name_only(line, name, sizeof(name)) != 0) {
@@ -370,7 +417,7 @@ static void* client_thread(void* arg) {
     int taken = active_name_has(name);
     if (!taken) {
         taken = (active_name_add(name) != 0);
-        if (!taken) active_name_set_fd(name, cfd);
+        if (!taken) my_token = active_name_set_fd(name, cfd);
     }
     pthread_mutex_unlock(&g_names_mtx);
     if (taken) {
@@ -382,7 +429,7 @@ static void* client_thread(void* arg) {
     // Acknowledge handshake for the Java client (its first OK)
     if (write_all(cfd, "C45OK\n") < 0) {
         pthread_mutex_lock(&g_names_mtx);
-        active_name_remove_if_fd(name, cfd);
+        active_name_remove_if_token(name, my_token);
         pthread_mutex_unlock(&g_names_mtx);
         close(cfd);
         return NULL;
@@ -392,12 +439,13 @@ static void* client_thread(void* arg) {
     if (send_lobbies_snapshot(cfd) < 0) {
         printf("[ERR] Cannot send snapshot lobbies (fd=%d)\n", cfd);
         pthread_mutex_lock(&g_names_mtx);
-        active_name_remove_if_fd(name, cfd);
+        active_name_remove_if_token(name, my_token);
         pthread_mutex_unlock(&g_names_mtx);
         close(cfd);
         return NULL;
     }
 
+lobby_select:
     for (;;) {
         /* --- waiting for player selection: C45<name><lobby>\n --- */
         lobby_num = -1;
@@ -566,7 +614,7 @@ next_round:
 
 disconnect:
     pthread_mutex_lock(&g_names_mtx);
-    active_name_remove_if_fd(name, cfd);
+    active_name_remove_if_token(name, my_token);
     pthread_mutex_unlock(&g_names_mtx);
     close(cfd);
     return NULL;
