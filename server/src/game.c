@@ -246,13 +246,47 @@ static void send_hand_snapshot(int fd, const Card* hand, int hand_size) {
     }
 }
 
+static int is_back_request_for_name(const char* line, const char* expected_name) {
+    if (!line || !expected_name || expected_name[0] == '\0') return 0;
+    if (strncmp(line, "C45", 3) != 0) return 0;
+
+    const char* s = line + 3;
+    while (*s == ' ' || *s == '\t') s++;
+
+    char tmp[READ_BUF];
+    strncpy(tmp, s, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    for (int i = (int)strlen(tmp) - 1; i >= 0 &&
+             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
+        tmp[i] = '\0';
+    }
+
+    const char* suffix = "back";
+    size_t len = strlen(tmp);
+    size_t slen = strlen(suffix);
+    if (len <= slen) return 0;
+    if (strcmp(tmp + (len - slen), suffix) != 0) return 0;
+
+    tmp[len - slen] = '\0';
+    for (int i = (int)strlen(tmp) - 1; i >= 0 && (tmp[i] == ' ' || tmp[i] == '\t'); --i) {
+        tmp[i] = '\0';
+    }
+    if (tmp[0] == '\0') return -1;
+
+    return (strncmp(tmp, expected_name, MAX_NAME_LEN) == 0) ? 1 : -1;
+}
+
 // Waits up to RECONNECT_TIMEOUT_SEC for missing_idx to reconnect (fd != -1).
 // Returns: 0=reconnected, 1=timeout, -1=other player disconnected.
 static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
     char missing_name[MAX_NAME_LEN];
+    char other_name[MAX_NAME_LEN];
     pthread_mutex_lock(&L->mtx);
     strncpy(missing_name, L->players[missing_idx].name, sizeof(missing_name) - 1);
     missing_name[sizeof(missing_name) - 1] = '\0';
+    strncpy(other_name, L->players[other_idx].name, sizeof(other_name) - 1);
+    other_name[sizeof(other_name) - 1] = '\0';
     int other_fd = L->players[other_idx].fd;
     pthread_mutex_unlock(&L->mtx);
 
@@ -305,6 +339,9 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
             return -1;
         } else if (strncmp(buf, "C45PONG", 7) == 0) {
             last_pong = now;
+        } else if (is_back_request_for_name(buf, other_name) == 1) {
+            active_name_mark_back(other_name, other_fd);
+            return 1; // treat as disconnect-timeout -> end game early
         }
 
         if (now - last_pong > PONG_TIMEOUT_SEC) return -1;
@@ -390,22 +427,31 @@ static void* lobby_game_thread(void* arg) {
 	                        if (other_idx == p0) goto pause_a;
 	                        else goto pause_b;
 	                    }
-	                    if (op.revents & POLLIN) {
-	                        char peek;
-	                        ssize_t rr = recv(other_fd, &peek, 1, MSG_PEEK | MSG_DONTWAIT);
-	                        if (rr == 0) {
-	                            if (other_idx == p0) goto pause_a;
-	                            else goto pause_b;
-	                        }
-	                        if (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-	                            if (other_idx == p0) goto pause_a;
-	                            else goto pause_b;
-	                        }
-	                        // Drain any unexpected input from the non-active player (prevents queueing).
-	                        for (;;) {
-	                            char dump[256];
-	                            ssize_t dr = recv(other_fd, dump, sizeof(dump), MSG_DONTWAIT);
-	                            if (dr > 0) continue;
+		                    if (op.revents & POLLIN) {
+		                        char peekbuf[16];
+		                        ssize_t rr = recv(other_fd, peekbuf, sizeof(peekbuf) - 1, MSG_PEEK | MSG_DONTWAIT);
+		                        if (rr == 0) {
+		                            if (other_idx == p0) goto pause_a;
+		                            else goto pause_b;
+		                        }
+		                        if (rr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+		                            if (other_idx == p0) goto pause_a;
+		                            else goto pause_b;
+		                        }
+		                        if (rr > 0) {
+		                            peekbuf[rr] = '\0';
+		                            // Out-of-turn commands are a protocol violation: kick the offender and finish the game.
+		                            if (strncmp(peekbuf, "C45HIT", 6) == 0 || strncmp(peekbuf, "C45STAND", 8) == 0) {
+		                                player_disconnect_fd(L, other_idx);
+		                                forced_winner_idx = turn;
+		                                goto end_game;
+		                            }
+		                        }
+		                        // Drain any unexpected input from the non-active player (prevents queueing).
+		                        for (;;) {
+		                            char dump[256];
+		                            ssize_t dr = recv(other_fd, dump, sizeof(dump), MSG_DONTWAIT);
+		                            if (dr > 0) continue;
 	                            if (dr == 0) {
 	                                if (other_idx == p0) goto pause_a;
 	                                else goto pause_b;
@@ -430,15 +476,22 @@ static void* lobby_game_thread(void* arg) {
             }
 
             char buf[READ_BUF];
-            int r = read_line_timeout(pfd, buf, sizeof(buf), 1);
-            if (r == -2) {
-                // no input this second
-            } else if (r <= 0) {
-                goto pause_turn;
-            } else if (strncmp(buf, "C45PONG", 7) == 0) {
-                last_pong = now;
-                continue;
-            } else if (strncmp(buf, "C45HIT", 6) == 0) {
+	            int r = read_line_timeout(pfd, buf, sizeof(buf), 1);
+	            if (r == -2) {
+	                // no input this second
+	            } else if (r <= 0) {
+	                goto pause_turn;
+	            } else if (strncmp(buf, "C45PONG", 7) == 0) {
+	                last_pong = now;
+	                continue;
+	            } else if (strncmp(buf, "C45YES", 6) == 0) {
+	                // Can arrive late from the lobby waiting phase; ignore.
+	                continue;
+	            } else if (is_back_request_for_name(buf, L->players[turn].name) == 1) {
+	                active_name_mark_back(L->players[turn].name, pfd);
+	                forced_winner_idx = 1 - turn;
+	                goto end_game;
+	            } else if (strncmp(buf, "C45HIT", 6) == 0) {
             pthread_mutex_lock(&L->mtx);
             Card nc = deck_draw(&L->deck);
             Player* P = &L->players[turn];
@@ -450,15 +503,15 @@ static void* lobby_game_thread(void* arg) {
 	            // check for overhand
 	            pthread_mutex_lock(&L->mtx);
 	            int v = hand_value(P->hand, P->hand_size);
-	            if (v > 21) {
-	                P->busted = 1;
-	                pthread_mutex_unlock(&L->mtx);
-	                snprintf(line, sizeof(line), "C45BUST %s %d\n", P->name, v);
-	                if (fdA >= 0 && write_all(fdA, line) < 0) goto pause_a;
-	                if (fdB >= 0 && write_all(fdB, line) < 0) goto pause_b;
-	            } else {
-	                pthread_mutex_unlock(&L->mtx);
-	            }
+		            if (v > 21) {
+		                P->busted = 1;
+		                pthread_mutex_unlock(&L->mtx);
+		                snprintf(line, sizeof(line), "C45BUST %s %d\n", P->name, v);
+		                // Send bust only to the player who busted (do not reveal to opponent mid-game).
+		                if (write_all(pfd, line) < 0) goto pause_turn;
+		            } else {
+		                pthread_mutex_unlock(&L->mtx);
+		            }
 	            // Step-by-step: after HIT (bust or not) the turn goes to the other player.
 	            turn = 1 - turn;
 	            break;
@@ -468,13 +521,16 @@ static void* lobby_game_thread(void* arg) {
                 pthread_mutex_unlock(&L->mtx);
                 turn = 1 - turn;
                 break;
-            }
+	            } else {
+	                // Any other line is a protocol violation: kick the current player and end the game.
+	                player_disconnect_fd(L, turn);
+	                forced_winner_idx = 1 - turn;
+	                goto end_game;
+	            }
 
-            // ignore unexpected lines
+	            if (now - last_pong > PONG_TIMEOUT_SEC) goto pause_turn;
 
-            if (now - last_pong > PONG_TIMEOUT_SEC) goto pause_turn;
-
-            if (now - turn_start >= TURN_TIMEOUT_SEC) {
+	            if (now - turn_start >= TURN_TIMEOUT_SEC) {
                 // If the client is alive (keeps answering pong) -> timeout means auto-stand.
                 // If not -> treat as disconnect and allow reconnect.
                 if (now - last_pong > PONG_TIMEOUT_SEC) goto pause_turn;

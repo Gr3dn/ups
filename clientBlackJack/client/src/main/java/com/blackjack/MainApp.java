@@ -129,12 +129,27 @@ public class MainApp extends Application {
     private Scene buildNameScene() {
         TextField nameField = new TextField();
         nameField.setPromptText("Your name");
+        // Protocol uses whitespace-delimited tokens, so names must not contain spaces/tabs/newlines.
+        nameField.setTextFormatter(new TextFormatter<>(change -> {
+            String t = change.getText();
+            if (t != null && t.chars().anyMatch(Character::isWhitespace)) return null;
+            return change;
+        }));
         Button sendBtn = new Button("Send");
         Label status = new Label();
 
         sendBtn.setOnAction(e -> {
-            name = nameField.getText().trim();
-            if (name.isEmpty()) { status.setText("Name cannot be empty."); return; }
+            String candidate = nameField.getText().trim();
+            if (candidate.isEmpty()) { status.setText("Name cannot be empty."); return; }
+            if (candidate.chars().anyMatch(Character::isWhitespace)) {
+                status.setText("Name cannot contain spaces.");
+                return;
+            }
+            if (candidate.length() > 63) {
+                status.setText("Name is too long (max 63 chars).");
+                return;
+            }
+            name = candidate;
             sendBtn.setDisable(true);
             status.setText("Sending name...");
 
@@ -188,6 +203,7 @@ public class MainApp extends Application {
     private Scene buildLobbyChoiceScene(ObservableList<LobbyRow> rows) {
         VBox listBox = new VBox(8);
         listBox.setFillWidth(true);
+        int maxLobby = rows.stream().mapToInt(LobbyRow::getId).max().orElse(0);
 
         Label title = new Label("Available lobbies:");
         title.setStyle("-fx-font-size: 16px; -fx-font-weight: bold;");
@@ -204,7 +220,7 @@ public class MainApp extends Application {
         }
 
         TextField lobbyField = new TextField();
-        lobbyField.setPromptText("Enter lobby number(1-5)");
+        lobbyField.setPromptText("Enter lobby number(1-" + maxLobby + ")");
 
         Label status = new Label();
         Button joinBtn = new Button("Connect to lobby");
@@ -214,9 +230,9 @@ public class MainApp extends Application {
             int num;
             try {
                 num = Integer.parseInt(t);
-                if (num < 1 || num > 5) throw new NumberFormatException();
+                if (num < 1 || num > maxLobby) throw new NumberFormatException();
             } catch (NumberFormatException ex) {
-                status.setText("Enter number from 1 to 5.");
+                status.setText("Enter number from 1 to " + maxLobby + ".");
                 return;
             }
 

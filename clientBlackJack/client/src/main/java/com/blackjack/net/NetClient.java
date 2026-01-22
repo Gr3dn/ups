@@ -18,6 +18,21 @@ public class NetClient {
     private volatile boolean closing = false;
     private volatile String lastName = null;
     private volatile int lastLobby = -1;
+    private volatile State state = State.WAIT_OK;
+    private volatile boolean expectLobbySnapshot = false;
+
+    private enum State {
+        WAIT_OK,
+        WAIT_LOBBIES,
+        LOBBY_CHOICE,
+        LOBBY_WAIT_OR_GAME,
+        IN_GAME,
+        AFTER_GAME
+    }
+
+    private static final class ProtocolException extends Exception {
+        ProtocolException(String message) { super(message); }
+    }
 
     private NetClient(Socket s, String host, int port, int timeoutMs) throws IOException {
         this.host = host;
@@ -42,6 +57,7 @@ public class NetClient {
                     String line = br.readLine();
                     if (line == null) throw new EOFException("server closed");
                     String t = line.trim();
+                    System.out.println(t);
                     if (t.isEmpty()) continue;
 
                     if (t.startsWith("C45PING")) {
@@ -52,6 +68,7 @@ public class NetClient {
                         continue;
                     }
                     if (t.startsWith("C45OPPDOWN")) {
+                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME, State.AFTER_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
                         String sec = (p.length >= 3) ? p[2] : "30";
@@ -59,10 +76,15 @@ public class NetClient {
                         continue;
                     }
                     if (t.startsWith("C45OPPBACK")) {
+                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
                         l.onResult(who + " reconnected. Continuing the game.");
                         continue;
+                    }
+
+                    if (!t.startsWith("C45")) {
+                        throw new ProtocolException("Bad server message (no C45 prefix): " + t);
                     }
 
                     // C45LL... parsing
@@ -76,53 +98,89 @@ public class NetClient {
 
                     // базовые токены
                     if (t.startsWith("C45OK")) {
-                        if (!okSeen) { okSeen = true; l.onOk(); }
-                        else { l.onLobbyJoinOk(); }
-
+                        if (!okSeen) {
+                            okSeen = true;
+                            ensureState(t, State.WAIT_OK);
+                            state = State.WAIT_LOBBIES;
+                            expectLobbySnapshot = true;
+                            l.onOk();
+                        } else {
+                            ensureState(t, State.LOBBY_CHOICE);
+                            state = State.LOBBY_WAIT_OR_GAME;
+                            l.onLobbyJoinOk();
+                        }
                         continue;
                     }
                     if(t.startsWith("C45WRONG NAME_TAKEN")){
                         l.onServerError("Name has been taken");
-                        break;
+                        closeQuietly();
+                        return;
                     }
                     if (t.startsWith("C45WRONG") || t.startsWith("WRONG")) {
                         l.onServerError("WRONG");
-                        continue;
+                        closeQuietly();
+                        return;
                     }
 
                     // снимок лобби: "C45LOBBIES N" + N строк "C45LOBBY ..."
                     if (t.startsWith("C45LOBBIES")) {
+                        if (!expectLobbySnapshot && state != State.WAIT_LOBBIES) {
+                            throw new ProtocolException("Unexpected lobby snapshot: " + t);
+                        }
                         String[] p = t.split("\\s+");
-                        int n = (p.length >= 2) ? Integer.parseInt(p[1]) : Integer.parseInt(br.readLine().trim());
+                        if (p.length < 2) throw new ProtocolException("Bad C45LOBBIES header: " + t);
+                        int n = parsePositiveInt(p[1], "lobby count");
+                        if (n > 100) throw new ProtocolException("Too many lobbies: " + n);
                         List<LobbyRow> rows = new ArrayList<>();
-                        for (int i = 0; i < n; i++) rows.add(parseLobbyLine(br.readLine().trim()));
+                        for (int i = 0; i < n; i++) {
+                            String ln = br.readLine();
+                            if (ln == null) throw new EOFException("server closed during snapshot");
+                            rows.add(parseLobbyLine(ln.trim()));
+                        }
                         l.onLobbySnapshot(rows);
+                        state = State.LOBBY_CHOICE;
+                        expectLobbySnapshot = false;
                         continue;
                     }
 
                     // игровая часть
                     if (t.startsWith("C45DEAL")) {
                         String[] p = t.split("\\s+");
+                        if (p.length < 3) throw new ProtocolException("Bad C45DEAL: " + t);
+                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         l.onDeal(p[1], p[2]);
+                        state = State.IN_GAME;
                         continue;
                     }
                     if (t.startsWith("C45TURN")) {
                         String[] p = t.split("\\s+");
+                        if (p.length < 3) throw new ProtocolException("Bad C45TURN: " + t);
+                        ensureStateIn(t, State.IN_GAME);
                         String who = (p.length >= 2) ? p[1] : "?";
-                        int sec = (p.length >= 3) ? Integer.parseInt(p[2]) : 30;
+                        int sec = parsePositiveInt(p[2], "turn seconds");
+                        if (sec > 300) throw new ProtocolException("Bad turn seconds: " + sec);
                         l.onTurn(who, sec); continue;
                     }
                     if (t.startsWith("C45CARD")) {
                         String[] p = t.split("\\s+");
+                        ensureStateIn(t, State.IN_GAME);
                         if (p.length >= 2) l.onCard(p[1]); continue;
                     }
                     if (t.startsWith("C45BUST")) {
                         String[] p = t.split("\\s+");
+                        if (p.length < 3) throw new ProtocolException("Bad C45BUST: " + t);
+                        ensureStateIn(t, State.IN_GAME);
                         if (p.length >= 3) l.onBust(p[1], Integer.parseInt(p[2])); continue;
                     }
+                    if (t.startsWith("C45TIMEOUT")) {
+                        ensureStateIn(t, State.IN_GAME);
+                        continue;
+                    }
                     if (t.startsWith("C45RESULT")) {
+                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         String data = t.substring("C45RESULT".length()).trim();
                         String[] parts = data.split(" ");
+                        if (parts.length < 6) throw new ProtocolException("Bad C45RESULT: " + t);
                         String p1     = parts[0];
                         String score1 = parts[1];
                         String p2     = parts[2];
@@ -138,15 +196,29 @@ public class NetClient {
                                         p2 + ": " + score2;
 
                         l.onResult(result);
+                        state = State.AFTER_GAME;
                         continue;
                     }
                     if (t.startsWith("C45WAITING")) {
+                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME);
                         try {
                             sendYes();
                         } catch (IOException ioe) {
                             l.onServerError("send C45YES failed: " + ioe.getMessage());
                         }
+                        continue;
                     }
+
+                    if (t.startsWith("C45END")) {
+                        continue;
+                    }
+
+                    throw new ProtocolException("Unknown server message: " + t);
+                } catch (ProtocolException | NumberFormatException ex) {
+                    if (closing) return;
+                    l.onServerError(ex.getMessage());
+                    closeQuietly();
+                    return;
                 } catch (Exception ex) {
                     if (closing) return;
                     if (tryReconnect()) continue;
@@ -169,12 +241,15 @@ public class NetClient {
     public synchronized void sendRaw(String s) throws IOException { os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
     public void sendName(String name) throws IOException {
         lastName = name;
+        state = State.WAIT_OK;
+        expectLobbySnapshot = true;
         sendRaw("C45" + name + "\n");
     }
     // Совместимо с твоим текущим форматом "C45<name><lobby>"
     public void sendJoin(String name, int lobby) throws IOException {
         lastName = name;
         lastLobby = lobby;
+        state = State.LOBBY_CHOICE;
         sendRaw("C45" + name + lobby + "\n");
         System.out.println(lobby);
     }
@@ -183,7 +258,10 @@ public class NetClient {
     public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
     public void sendYes() throws IOException { sendRaw("C45YES\n"); }
     public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
-    public void sendBackToLobby(String name) throws IOException { sendRaw("C45" + (name == null ? "" : name) + "back\n"); }
+    public void sendBackToLobby(String name) throws IOException {
+        expectLobbySnapshot = true;
+        sendRaw("C45" + (name == null ? "" : name) + "back\n");
+    }
 
 //    public void sendName(String name) throws IOException { sendRaw(buildC45Frame(name)); }
 //    // "C45<name><lobby>" как и было — но в payload
@@ -232,16 +310,58 @@ public class NetClient {
 
 
     // перенос парсера строки лобби из MainApp
-    private LobbyRow parseLobbyLine(String line) throws IOException {
+    private LobbyRow parseLobbyLine(String line) throws ProtocolException {
         String[] parts = line.split("\\s+");
-        if (parts.length != 4 || !parts[0].equalsIgnoreCase("C45LOBBY"))
-            throw new IOException("Bad lobby line: " + line);
-        int id = Integer.parseInt(parts[1]);
-        String[] ps = parts[2].split("=")[1].split("/");
-        int players = Integer.parseInt(ps[0]);
-        int cap = Integer.parseInt(ps[1]);
-        String status = parts[3].split("=")[1];
+        if (parts.length != 4 || !parts[0].equalsIgnoreCase("C45LOBBY")) {
+            throw new ProtocolException("Bad lobby line: " + line);
+        }
+        int id = parsePositiveInt(parts[1], "lobby id");
+
+        String[] pp = parts[2].split("=");
+        if (pp.length != 2 || !pp[0].equalsIgnoreCase("players")) {
+            throw new ProtocolException("Bad lobby players: " + line);
+        }
+        String[] ps = pp[1].split("/");
+        if (ps.length != 2) throw new ProtocolException("Bad lobby players: " + line);
+        int players = parseNonNegativeInt(ps[0], "players");
+        int cap = parsePositiveInt(ps[1], "capacity");
+        if (players > cap) throw new ProtocolException("Bad lobby players: " + line);
+
+        String[] ss = parts[3].split("=");
+        if (ss.length != 2 || !ss[0].equalsIgnoreCase("status")) {
+            throw new ProtocolException("Bad lobby status: " + line);
+        }
+        String status = ss[1];
         return new LobbyRow(id, players, cap, status);
+    }
+
+    private void ensureState(String msg, State expected) throws ProtocolException {
+        if (state != expected) throw new ProtocolException("Bad client state for message: " + msg);
+    }
+
+    private void ensureStateIn(String msg, State... allowed) throws ProtocolException {
+        for (State s : allowed) if (state == s) return;
+        throw new ProtocolException("Bad client state for message: " + msg);
+    }
+
+    private static int parsePositiveInt(String s, String ctx) throws ProtocolException {
+        try {
+            int v = Integer.parseInt(s);
+            if (v <= 0) throw new NumberFormatException();
+            return v;
+        } catch (NumberFormatException ex) {
+            throw new ProtocolException("Bad " + ctx + ": " + s);
+        }
+    }
+
+    private static int parseNonNegativeInt(String s, String ctx) throws ProtocolException {
+        try {
+            int v = Integer.parseInt(s);
+            if (v < 0) throw new NumberFormatException();
+            return v;
+        } catch (NumberFormatException ex) {
+            throw new ProtocolException("Bad " + ctx + ": " + s);
+        }
     }
 
     // --- C45 framed messages ---

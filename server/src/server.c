@@ -4,6 +4,7 @@
 #include "game.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -13,13 +14,16 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ACTIVE_MAX 256
+#define WAITING_INTERVAL_SEC 5
 // Reserving names among all active connections (until disconnect)
 static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_active_names[ACTIVE_MAX][MAX_NAME_LEN];
 static int  g_active_fds[ACTIVE_MAX];
+static int  g_active_back_req[ACTIVE_MAX];
 static int  g_active_cnt = 0;
 
 /* --- Help --- */
@@ -38,6 +42,7 @@ int active_name_add(const char* n) {
     strncpy(g_active_names[g_active_cnt++], n, MAX_NAME_LEN);
     g_active_names[g_active_cnt-1][MAX_NAME_LEN-1] = '\0';
     g_active_fds[g_active_cnt-1] = -1;
+    g_active_back_req[g_active_cnt-1] = 0;
     return 0;
 }
 void active_name_remove(const char* n) {
@@ -47,7 +52,9 @@ void active_name_remove(const char* n) {
             if (i != g_active_cnt - 1) {
                 memcpy(g_active_names[i], g_active_names[g_active_cnt-1], MAX_NAME_LEN);
                 g_active_fds[i] = g_active_fds[g_active_cnt-1];
+                g_active_back_req[i] = g_active_back_req[g_active_cnt-1];
             }
+            g_active_back_req[g_active_cnt-1] = 0;
             g_active_cnt--;
             return;
         }
@@ -71,6 +78,28 @@ static void active_name_remove_if_fd(const char* n, int fd) {
     if (i < 0) return;
     if (g_active_fds[i] != fd) return;
     active_name_remove(n);
+}
+
+void active_name_mark_back(const char* n, int fd) {
+    if (!n || !*n) return;
+    pthread_mutex_lock(&g_names_mtx);
+    int i = active_name_find(n);
+    if (i >= 0 && (fd < 0 || g_active_fds[i] == fd)) {
+        g_active_back_req[i] = 1;
+    }
+    pthread_mutex_unlock(&g_names_mtx);
+}
+
+int active_name_take_back(const char* n, int fd) {
+    if (!n || !*n) return 0;
+    pthread_mutex_lock(&g_names_mtx);
+    int i = active_name_find(n);
+    int ok = (i >= 0 &&
+              g_active_back_req[i] &&
+              (fd < 0 || g_active_fds[i] == fd));
+    if (ok) g_active_back_req[i] = 0;
+    pthread_mutex_unlock(&g_names_mtx);
+    return ok;
 }
 
 static int lobby_try_reconnect(int lobby_index, const char* name, int fd) {
@@ -187,6 +216,9 @@ static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, i
     }
     if (pos < 0) return -6;
 
+    for (int i = 0; tmp[i]; ++i) {
+        if (isspace((unsigned char)tmp[i])) return -8; // protocol uses whitespace delimiters
+    }
     if ((int)strlen(tmp) >= out_name_sz) return -7;
 
     strcpy(out_name, tmp);
@@ -211,6 +243,9 @@ static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
         tmp[i] = '\0';
     }
     if (tmp[0] == '\0') return -2;
+    for (int i = 0; tmp[i]; ++i) {
+        if (isspace((unsigned char)tmp[i])) return -4; // protocol uses whitespace delimiters
+    }
     if ((int)strlen(tmp) >= out_name_sz) return -3;
 
     strcpy(out_name, tmp);
@@ -292,16 +327,21 @@ static void* client_thread(void* arg) {
             close(cfd);
             return NULL;
         }
-
-        pthread_mutex_lock(&g_names_mtx);
-        int reserved = active_name_has(name);
-        pthread_mutex_unlock(&g_names_mtx);
-        if (!reserved || lobby_try_reconnect(lobby_num - 1, name, cfd) != 0) {
+        if (lobby_try_reconnect(lobby_num - 1, name, cfd) != 0) {
             write_all(cfd, "C45WRONG RECONNECT\n");
             close(cfd);
             return NULL;
         }
+
         pthread_mutex_lock(&g_names_mtx);
+        if (!active_name_has(name)) {
+            if (active_name_add(name) != 0) {
+                pthread_mutex_unlock(&g_names_mtx);
+                write_all(cfd, "C45WRONG RECONNECT\n");
+                close(cfd);
+                return NULL;
+            }
+        }
         active_name_set_fd(name, cfd);
         pthread_mutex_unlock(&g_names_mtx);
 
@@ -317,6 +357,12 @@ static void* client_thread(void* arg) {
         return NULL;
     }
     printf("[PROTO] Handshake OK '%s' from fd=%d\n", name, cfd);
+
+    if (lobby_name_exists(name)) {
+        write_all(cfd, "C45WRONG NAME_TAKEN\n");
+        close(cfd);
+        return NULL;
+    }
 
     // Reserve name for the whole lifetime of this connection
     pthread_mutex_lock(&g_names_mtx);
@@ -369,19 +415,19 @@ static void* client_thread(void* arg) {
                 continue;
             } else if (br < 0) {
                 write_all(cfd, "C45WRONG\n");
-                continue;
+                goto disconnect; // invalid back request
             }
 
             char join_name[MAX_NAME_LEN];
             if (parse_name_lobby(line, join_name, sizeof(join_name), &lobby_num) != 0) {
                 printf("[PROTO] Wrong format of choise -> C45WRONG (fd=%d)\n", cfd);
                 write_all(cfd, "C45WRONG\n");
-                continue;
+                goto disconnect;
             }
             if (strncmp(join_name, name, MAX_NAME_LEN) != 0) {
                 printf("[PROTO] Join name mismatch '%s' != '%s' (fd=%d)\n", join_name, name, cfd);
                 write_all(cfd, "C45WRONG\n");
-                continue;
+                goto disconnect;
             }
             break;
         }
@@ -407,27 +453,33 @@ static void* client_thread(void* arg) {
         printf("[PROTO] -> C45OK '%s' in Lobby #%d (fd=%d)\n", name, lobby_num, cfd);
         start_game_if_ready(lobby_num - 1);
 
-        printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+	        printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
 
-        // wait until the game actually starts (or client cancels/disconnects)
-        for (;;) {
-            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
-            int running = g_lobbies[lobby_num - 1].is_running;
-            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
-            if (running) break;
+	        // wait until the game actually starts (or client cancels/disconnects)
+	        time_t last_waiting_sent = 0;
+	        for (;;) {
+	            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
+	            int running = g_lobbies[lobby_num - 1].is_running;
+	            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
+	            if (running) break;
 
-            if (write_all(cfd, "C45WAITING\n") < 0) {
-                printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
-                lobby_remove_player_by_name(name);
-                goto disconnect;
-            }
+	            time_t now = time(NULL);
+	            if (now - last_waiting_sent >= WAITING_INTERVAL_SEC) {
+	                if (write_all(cfd, "C45WAITING\n") < 0) {
+	                    printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
+	                    lobby_remove_player_by_name(name);
+	                    goto disconnect;
+	                }
+	                last_waiting_sent = now;
+	            }
 
-            int r = read_line(cfd, line, sizeof(line));
-            if (r <= 0) {
-                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
-                lobby_remove_player_by_name(name);
-                goto disconnect;
-            }
+	            int r = read_line_timeout(cfd, line, sizeof(line), 1);
+	            if (r == -2) continue; // no input this second
+	            if (r <= 0) {
+	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+	                lobby_remove_player_by_name(name);
+	                goto disconnect;
+	            }
             if (strncmp(line, "C45YES", 6) == 0) continue;
 
             int br = is_back_request_for(line, name);
@@ -437,7 +489,10 @@ static void* client_thread(void* arg) {
                 if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
                 goto next_round;
             }
-            // ignore unexpected lines while waiting
+            // Any other line while waiting is a protocol error.
+            write_all(cfd, "C45WRONG\n");
+            lobby_remove_player_by_name(name);
+            goto disconnect;
         }
 
         printf("[GAME] '%s' Game started in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
@@ -447,12 +502,20 @@ game_wait:
         while (lobby_name_exists(name)) usleep(10000);
 
         printf("[GAME] '%s' Game finished, waiting for '%sback' (fd=%d)\n", name, name, cfd);
+        if (active_name_take_back(name, cfd)) {
+            if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+            goto next_round;
+        }
         for (;;) {
             n = read_line(cfd, line, sizeof(line));
             if (n <= 0) goto disconnect;
+            if (strncmp(line, "C45PONG", 7) == 0) continue;
+            if (strncmp(line, "C45YES", 6) == 0) continue;
             int br = is_back_request_for(line, name);
             if (br == 1) break;
-            if (br < 0) write_all(cfd, "C45WRONG\n");
+            // Any other line after game end is a protocol error.
+            write_all(cfd, "C45WRONG\n");
+            goto disconnect;
         }
 
         if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
