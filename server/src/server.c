@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -473,27 +474,66 @@ static void* client_thread(void* arg) {
 	                last_waiting_sent = now;
 	            }
 
-	            int r = read_line_timeout(cfd, line, sizeof(line), 1);
-	            if (r == -2) continue; // no input this second
+	            struct pollfd pfd = { .fd = cfd, .events = POLLIN | POLLHUP | POLLERR };
+	            int pr = poll(&pfd, 1, 1000);
+	            if (pr == 0) continue;
+	            if (pr < 0) {
+	                if (errno == EINTR) continue;
+	                printf("[WAIT] poll failed while waiting (fd=%d)\n", cfd);
+	                lobby_remove_player_by_name(name);
+	                goto disconnect;
+	            }
+	            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+	                lobby_remove_player_by_name(name);
+	                goto disconnect;
+	            }
+	            if (!(pfd.revents & POLLIN)) continue;
+
+	            // Re-check running before consuming any input to avoid stealing game traffic.
+	            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
+	            running = g_lobbies[lobby_num - 1].is_running;
+	            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
+	            if (running) break;
+
+	            char peekbuf[READ_BUF];
+	            ssize_t rr = recv(cfd, peekbuf, sizeof(peekbuf) - 1, MSG_PEEK | MSG_DONTWAIT);
+	            if (rr == 0) {
+	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+	                lobby_remove_player_by_name(name);
+	                goto disconnect;
+	            }
+	            if (rr < 0) {
+	                if (errno == EINTR) continue;
+	                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+	                printf("[WAIT] recv peek failed while waiting (fd=%d)\n", cfd);
+	                lobby_remove_player_by_name(name);
+	                goto disconnect;
+	            }
+	            peekbuf[rr] = '\0';
+	            if (!strchr(peekbuf, '\n')) continue; // wait for a complete line
+
+	            int r = read_line(cfd, line, sizeof(line));
 	            if (r <= 0) {
 	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
 	                lobby_remove_player_by_name(name);
 	                goto disconnect;
 	            }
-            if (strncmp(line, "C45YES", 6) == 0) continue;
 
-            int br = is_back_request_for(line, name);
-            if (br == 1) {
-                // Cancel waiting: remove from lobby and return to lobby selection
-                lobby_remove_player_by_name(name);
-                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
-                goto next_round;
-            }
-            // Any other line while waiting is a protocol error.
-            write_all(cfd, "C45WRONG\n");
-            lobby_remove_player_by_name(name);
-            goto disconnect;
-        }
+	            if (strncmp(line, "C45YES", 6) == 0) continue;
+
+	            int br = is_back_request_for(line, name);
+	            if (br == 1) {
+	                // Cancel waiting: remove from lobby and return to lobby selection
+	                lobby_remove_player_by_name(name);
+	                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+	                goto next_round;
+	            }
+	            // Any other line while waiting is a protocol error.
+	            write_all(cfd, "C45WRONG\n");
+	            lobby_remove_player_by_name(name);
+	            goto disconnect;
+	        }
 
         printf("[GAME] '%s' Game started in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
 game_wait:

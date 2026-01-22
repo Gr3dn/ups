@@ -238,7 +238,9 @@ public class NetClient {
     }
 
     // отправка команд
-    public synchronized void sendRaw(String s) throws IOException { os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
+    public synchronized void sendRaw(String s) throws IOException {
+        System.out.println(s);
+        os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
     public void sendName(String name) throws IOException {
         lastName = name;
         state = State.WAIT_OK;
