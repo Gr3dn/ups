@@ -11,6 +11,11 @@ public class NetClient {
     private final int port;
     private final int connectTimeoutMs;
 
+    private static final int SOCKET_READ_TIMEOUT_MS = 1000;
+    private static final int HEARTBEAT_INTERVAL_MS = 5000;
+    private static final int SERVER_SILENCE_TIMEOUT_MS = 15000;
+    private static final int HANDSHAKE_TIMEOUT_MS = 10000;
+
     private Socket socket;
     private OutputStream os;
     private BufferedReader br;
@@ -20,6 +25,10 @@ public class NetClient {
     private volatile int lastLobby = -1;
     private volatile State state = State.WAIT_OK;
     private volatile boolean expectLobbySnapshot = false;
+    private volatile long lastServerMessageMs = System.currentTimeMillis();
+    private volatile long lastPingMs = 0L;
+    private volatile long handshakeSentMs = 0L;
+    private volatile boolean handshakeDone = false;
 
     private enum State {
         WAIT_OK,
@@ -44,21 +53,25 @@ public class NetClient {
     public static NetClient connect(String host, int port, int timeoutMs) throws IOException {
         Socket s = new Socket();
         s.connect(new InetSocketAddress(host, port), timeoutMs);
-        // Do not auto-disconnect on long idle periods (lobby selection / after result).
-        s.setSoTimeout(0);
         return new NetClient(s, host, port, timeoutMs);
     }
 
     public void startReader(ProtocolListener l) {
         reader = new Thread(() -> {
+            lastServerMessageMs = System.currentTimeMillis();
+            lastPingMs = 0L;
             while (!closing) {
                 try {
                     String line = br.readLine();
                     if (line == null) throw new EOFException("server closed");
                     String t = line.trim();
+                    lastServerMessageMs = System.currentTimeMillis();
                     System.out.println(t);
                     if (t.isEmpty()) continue;
 
+                    if (t.startsWith("C45PONG")) {
+                        continue;
+                    }
                     if (t.startsWith("C45PING")) {
                         try { sendPong(); } catch (IOException ignored) {}
                         continue;
@@ -68,6 +81,7 @@ public class NetClient {
                         // or (if the game already ended) send a normal lobby snapshot.
                         state = State.LOBBY_WAIT_OR_GAME;
                         expectLobbySnapshot = true;
+                        handshakeDone = true;
                         continue;
                     }
                     if (t.startsWith("C45OPPDOWN")) {
@@ -106,6 +120,7 @@ public class NetClient {
                             state = State.WAIT_LOBBIES;
                             expectLobbySnapshot = true;
                             l.onOk();
+                            handshakeDone = true;
                         } else if (state == State.LOBBY_CHOICE) {
                             ensureState(t, State.LOBBY_CHOICE);
                             state = State.LOBBY_WAIT_OR_GAME;
@@ -218,6 +233,31 @@ public class NetClient {
                     }
 
                     throw new ProtocolException("Unknown server message: " + t);
+                } catch (SocketTimeoutException ste) {
+                    if (closing) return;
+                    long now = System.currentTimeMillis();
+
+                    if (!handshakeDone && handshakeSentMs > 0 &&
+                            now - handshakeSentMs > HANDSHAKE_TIMEOUT_MS) {
+                        if (tryReconnect()) continue;
+                        l.onServerError("Server handshake timeout");
+                        closeQuietly();
+                        return;
+                    }
+
+                    if (handshakeDone) {
+                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS) {
+                            try { sendPing(); } catch (IOException ignored) {}
+                            lastPingMs = now;
+                        }
+                        if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
+                            if (tryReconnect()) continue;
+                            l.onServerError("Server is not responding");
+                            closeQuietly();
+                            return;
+                        }
+                    }
+                    continue;
                 } catch (ProtocolException | NumberFormatException ex) {
                     if (closing) return;
                     l.onServerError(ex.getMessage());
@@ -247,6 +287,8 @@ public class NetClient {
         os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
     public void sendName(String name) throws IOException {
         lastName = name;
+        handshakeDone = false;
+        handshakeSentMs = System.currentTimeMillis();
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
         sendRaw("C45" + name + "\n");
@@ -264,6 +306,7 @@ public class NetClient {
     public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
     public void sendYes() throws IOException { sendRaw("C45YES\n"); }
     public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
+    public void sendPing() throws IOException { sendRaw("C45PING\n"); }
     public void sendBackToLobby(String name) throws IOException {
         expectLobbySnapshot = true;
         sendRaw("C45" + (name == null ? "" : name) + "back\n");
@@ -285,19 +328,25 @@ public class NetClient {
 
     private synchronized void replaceConnection(Socket s) throws IOException {
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+        s.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
+        s.setKeepAlive(true);
+        s.setTcpNoDelay(true);
         this.socket = s;
         this.os = s.getOutputStream();
         this.br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
+        lastServerMessageMs = System.currentTimeMillis();
+        lastPingMs = 0L;
     }
 
     private boolean tryReconnect() {
         String n = lastName;
         int lobby = lastLobby;
-        if (n == null || n.isBlank() || lobby <= 0) return false;
+        if (n == null || n.isBlank()) return false;
 
         // After reconnect we can either land back in the running game OR be redirected to lobby list.
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
+        handshakeDone = false;
 
         long deadline = System.currentTimeMillis() + 30000L;
         while (!closing && System.currentTimeMillis() < deadline) {
@@ -305,9 +354,13 @@ public class NetClient {
                 Socket s = new Socket();
                 int to = Math.min(connectTimeoutMs, 3000);
                 s.connect(new InetSocketAddress(host, port), to);
-                s.setSoTimeout(0);
                 replaceConnection(s);
-                sendRaw("C45RECONNECT " + n + " " + lobby + "\n");
+                handshakeSentMs = System.currentTimeMillis();
+                if (lobby > 0) {
+                    sendRaw("C45RECONNECT " + n + " " + lobby + "\n");
+                } else {
+                    sendRaw("C45" + n + "\n");
+                }
                 return true;
             } catch (Exception ignored) {
                 try { Thread.sleep(500); } catch (InterruptedException ie) { break; }

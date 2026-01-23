@@ -457,6 +457,13 @@ lobby_select:
             }
             printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
 
+            // Client keep-alive (bidirectional): reply and continue waiting for real commands.
+            if (strncmp(line, "C45PING", 7) == 0) {
+                (void)write_all(cfd, "C45PONG\n");
+                continue;
+            }
+            if (strncmp(line, "C45PONG", 7) == 0) continue;
+
             int br = is_back_request_for(line, name);
             if (br == 1) {
                 // Allow requesting the snapshot at any time outside the game loop
@@ -561,17 +568,22 @@ lobby_select:
 	            peekbuf[rr] = '\0';
 	            if (!strchr(peekbuf, '\n')) continue; // wait for a complete line
 
-	            int r = read_line(cfd, line, sizeof(line));
-	            if (r <= 0) {
-	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
-	                lobby_remove_player_by_name(name);
-	                goto disconnect;
-	            }
+		            int r = read_line(cfd, line, sizeof(line));
+		            if (r <= 0) {
+		                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+		                lobby_remove_player_by_name(name);
+		                goto disconnect;
+		            }
 
-	            if (strncmp(line, "C45YES", 6) == 0) continue;
+		            if (strncmp(line, "C45PING", 7) == 0) {
+		                (void)write_all(cfd, "C45PONG\n");
+		                continue;
+		            }
+		            if (strncmp(line, "C45PONG", 7) == 0) continue;
+		            if (strncmp(line, "C45YES", 6) == 0) continue;
 
-	            int br = is_back_request_for(line, name);
-	            if (br == 1) {
+		            int br = is_back_request_for(line, name);
+		            if (br == 1) {
 	                // Cancel waiting: remove from lobby and return to lobby selection
 	                lobby_remove_player_by_name(name);
 	                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
@@ -594,13 +606,17 @@ game_wait:
             if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
             goto next_round;
         }
-        for (;;) {
-            n = read_line(cfd, line, sizeof(line));
-            if (n <= 0) goto disconnect;
-            if (strncmp(line, "C45PONG", 7) == 0) continue;
-            if (strncmp(line, "C45YES", 6) == 0) continue;
-            int br = is_back_request_for(line, name);
-            if (br == 1) break;
+	        for (;;) {
+	            n = read_line(cfd, line, sizeof(line));
+	            if (n <= 0) goto disconnect;
+	            if (strncmp(line, "C45PING", 7) == 0) {
+	                (void)write_all(cfd, "C45PONG\n");
+	                continue;
+	            }
+	            if (strncmp(line, "C45PONG", 7) == 0) continue;
+	            if (strncmp(line, "C45YES", 6) == 0) continue;
+	            int br = is_back_request_for(line, name);
+	            if (br == 1) break;
             // Any other line after game end is a protocol error.
             write_all(cfd, "C45WRONG\n");
             goto disconnect;
@@ -637,6 +653,8 @@ int run_server(const char* bind_ip, int port) {
     // Bind IP
     if (!bind_ip || strcmp(bind_ip, "0.0.0.0") == 0) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (strcmp(bind_ip, "localhost") == 0) {
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     } else {
         if (inet_pton(AF_INET, bind_ip, &addr.sin_addr) != 1) {
             fprintf(stderr, "Invalid bind IP: %s\n", bind_ip);
