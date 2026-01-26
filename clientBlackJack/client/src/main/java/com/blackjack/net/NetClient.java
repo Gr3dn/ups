@@ -31,10 +31,12 @@ public class NetClient {
     // Keep HEARTBEAT_INTERVAL_MS <= SERVER_SILENCE_TIMEOUT_MS to avoid false "server not responding"
     // while the connection is simply idle.
     private static final int SOCKET_READ_TIMEOUT_MS = 1000;
-    private static final int HEARTBEAT_INTERVAL_MS = 2000;
+    private static final int HEARTBEAT_INTERVAL_MS = 3000;
     private static final int SERVER_SILENCE_TIMEOUT_MS = 4000;
+    private static final int PONG_RESPONSE_TIMEOUT_MS = 3000;
     private static final int HANDSHAKE_TIMEOUT_MS = 4000;
-    private static final int RECONNECT_WINDOW_MS = 5000;
+    private static final int RECONNECT_WINDOW_MS = 10000;
+    private static final int RECONNECT_MAX_ATTEMPTS = 5;
     private static final int RECONNECT_CONNECT_TIMEOUT_MS = 1000;
 
     private Socket socket;
@@ -48,8 +50,11 @@ public class NetClient {
     private volatile boolean expectLobbySnapshot = false;
     private volatile long lastServerMessageMs = System.currentTimeMillis();
     private volatile long lastPingMs = 0L;
+    private volatile long lastPingSentMs = 0L;
+    private volatile boolean awaitingPong = false;
     private volatile long handshakeSentMs = 0L;
     private volatile boolean handshakeDone = false;
+    private volatile String lastConnectFailureHint = null;
 
     private enum State {
         WAIT_OK,
@@ -62,6 +67,69 @@ public class NetClient {
 
     private static final class ProtocolException extends Exception {
         ProtocolException(String message) { super(message); }
+    }
+
+    /**
+     * Convert a connect/reconnect failure into a user-facing hint.
+     *
+     * This is used to differentiate between "server is down" and "your network is down"
+     * (e.g. unplugged cable / Wi‑Fi off), because both look like "no responses" on an
+     * already-established TCP connection.
+     *
+     * @param ex Failure exception (may have nested causes).
+     * @return Human-friendly hint string, or null if no specific hint can be derived.
+     */
+    private static String hintFromConnectFailure(Exception ex) {
+        if (ex == null) return null;
+
+        Throwable t = ex;
+        while (t != null) {
+            if (t instanceof UnknownHostException) {
+                return "Cannot resolve server address (check DNS / network).";
+            }
+            if (t instanceof SocketTimeoutException) {
+                return "Connection timed out (check your network).";
+            }
+
+            String msg = t.getMessage();
+            String m = (msg == null) ? "" : msg.toLowerCase(Locale.ROOT);
+
+            if (t instanceof ConnectException) {
+                if (m.contains("refused")) return "Server is offline (connection refused).";
+                if (m.contains("network is unreachable") || m.contains("no route")) {
+                    return "No network connection (check cable / Wi‑Fi).";
+                }
+                if (!m.isBlank()) return "Unable to connect to server: " + msg;
+                return "Unable to connect to server.";
+            }
+            if (t instanceof SocketException) {
+                if (m.contains("network is unreachable") || m.contains("no route")) {
+                    return "No network connection (check cable / Wi‑Fi).";
+                }
+                if (m.contains("connection reset") || m.contains("broken pipe")) {
+                    return "Connection lost.";
+                }
+            }
+
+            t = t.getCause();
+        }
+
+        return null;
+    }
+
+    /**
+     * Build the final user-facing error message after automatic reconnect fails.
+     *
+     * @return Human-friendly error message.
+     */
+    private String autoReconnectFailedMessage() {
+        String hint = lastConnectFailureHint;
+        String base =
+                "Unable to restore connection automatically (" +
+                        RECONNECT_MAX_ATTEMPTS + " attempts / " + (RECONNECT_WINDOW_MS / 1000) +
+                        " seconds). Please reconnect manually.";
+        if (hint == null || hint.isBlank()) return base;
+        return hint + " " + base;
     }
 
     /**
@@ -121,6 +189,7 @@ public class NetClient {
                     if (t.isEmpty()) continue;
 
                     if (t.startsWith("C45PONG")) {
+                        awaitingPong = false;
                         continue;
                     }
                     if (t.startsWith("C45PING")) {
@@ -148,15 +217,16 @@ public class NetClient {
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME, State.AFTER_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
-                        String sec = (p.length >= 3) ? p[2] : "30";
-                        l.onResult(who + " disconnected. Waiting up to " + sec + " seconds...");
+                        int sec = 30;
+                        if (p.length >= 3) sec = parsePositiveInt(p[2], "reconnect seconds");
+                        l.onOpponentDisconnected(who, sec);
                         continue;
                     }
                     if (t.startsWith("C45OPPBACK")) {
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
-                        l.onResult(who + " reconnected. Continuing the game.");
+                        l.onOpponentReconnected(who);
                         continue;
                     }
 
@@ -288,32 +358,45 @@ public class NetClient {
                     long now = System.currentTimeMillis();
                     if (!handshakeDone && handshakeSentMs > 0 &&
                             now - handshakeSentMs > HANDSHAKE_TIMEOUT_MS) {
-                        if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
-                        l.onServerError("Server handshake timeout");
+                        if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                        l.onServerError(autoReconnectFailedMessage());
                         closeQuietly();
                         return;
                     }
 
                     if (handshakeDone) {
-                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS) {
+                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS && !awaitingPong) {
                             try { sendPing(); } catch (IOException ignored) {}
                             lastPingMs = now;
                         }
+
+                        // Primary signal: we sent PING but didn't receive PONG in time.
+                        if (awaitingPong && (now - lastPingSentMs > PONG_RESPONSE_TIMEOUT_MS)) {
+                            if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                            l.onServerError(autoReconnectFailedMessage());
+                            closeQuietly();
+                            return;
+                        }
+
+                        // Fallback: no server messages at all for too long.
                         if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
-                            if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
-                            l.onServerError("Server is not responding");
+                            if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                            l.onServerError(autoReconnectFailedMessage());
                             closeQuietly();
                             return;
                         }
                     } else if (handshakeSentMs == 0) {
                         // Connected, but the user didn't send a name yet. Keep the connection alive and
                         // detect a dead server quickly by using PING/PONG even before the handshake.
-                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS) {
+                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS && !awaitingPong) {
                             try { sendPing(); } catch (IOException ignored) {}
                             lastPingMs = now;
                         }
                         if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
-                            l.onServerError("Server is not responding");
+                            // No name yet -> cannot use protocol reconnect, but we can still provide a hint
+                            // about local network state by probing a fresh TCP connect attempt.
+                            String hint = probeConnectHint();
+                            l.onServerError(hint != null ? hint : "Server is not responding");
                             closeQuietly();
                             return;
                         }
@@ -326,11 +409,12 @@ public class NetClient {
                     return;
                 } catch (Exception ex) {
                     if (closing) return;
-                    if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
+                    if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
                     if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
-                        l.onServerError("Unable to restore connection within " + (RECONNECT_WINDOW_MS / 1000) + " seconds.");
+                        l.onServerError(autoReconnectFailedMessage());
                     } else {
-                        l.onServerError(ex.getMessage());
+                        String hint = lastConnectFailureHint;
+                        l.onServerError(hint != null ? hint : ex.getMessage());
                     }
                     return;
                 }
@@ -389,7 +473,12 @@ public class NetClient {
     /** Send {@code C45PONG}. */
     public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
     /** Send {@code C45PING}. */
-    public void sendPing() throws IOException { sendRaw("C45PING\n"); }
+    public void sendPing() throws IOException {
+        long now = System.currentTimeMillis();
+        sendRaw("C45PING\n");
+        awaitingPong = true;
+        lastPingSentMs = now;
+    }
 
     /**
      * Request going back to lobby list.
@@ -443,6 +532,8 @@ public class NetClient {
         this.br = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
         lastServerMessageMs = System.currentTimeMillis();
         lastPingMs = 0L;
+        lastPingSentMs = 0L;
+        awaitingPong = false;
     }
 
     /**
@@ -451,7 +542,7 @@ public class NetClient {
      * @param windowMs Max time spent reconnecting.
      * @return true if reconnection succeeded; false otherwise.
      */
-    private boolean tryReconnect(long windowMs) {
+    private boolean tryReconnect(long windowMs, int maxAttempts) {
         String n = lastName;
         int lobby = lastLobby;
         if (n == null || n.isBlank()) return false;
@@ -462,10 +553,17 @@ public class NetClient {
         handshakeDone = false;
 
         long deadline = System.currentTimeMillis() + Math.max(0L, windowMs);
-        while (!closing && System.currentTimeMillis() < deadline) {
+        long perAttemptMs = Math.max(1L, windowMs / Math.max(1, maxAttempts));
+        Exception last = null;
+        int attempts = 0;
+        while (!closing && attempts < maxAttempts && System.currentTimeMillis() < deadline) {
+            long attemptStart = System.currentTimeMillis();
             try {
+                attempts++;
                 Socket s = new Socket();
                 int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining < to) to = (int)Math.max(1L, remaining);
                 s.connect(new InetSocketAddress(host, port), to);
                 replaceConnection(s);
                 handshakeSentMs = System.currentTimeMillis();
@@ -474,13 +572,42 @@ public class NetClient {
                 } else {
                     sendRaw("C45" + n + "\n");
                 }
+                lastConnectFailureHint = null;
                 return true;
-            } catch (Exception ignored) {
-                try { Thread.sleep(250); } catch (InterruptedException ie) { break; }
+            } catch (Exception ex) {
+                last = ex;
+                long elapsed = System.currentTimeMillis() - attemptStart;
+                long sleepMs = perAttemptMs - elapsed;
+                if (sleepMs > 0) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) break;
+                    try { Thread.sleep(Math.min(sleepMs, remaining)); }
+                    catch (InterruptedException ie) { break; }
+                }
             }
         }
 
+        lastConnectFailureHint = hintFromConnectFailure(last);
         return false;
+    }
+
+    /**
+     * Probe a fresh TCP connect attempt to provide a better error message.
+     *
+     * Used when we don't have enough state to perform a protocol reconnect (no nickname yet).
+     *
+     * @return Hint string, or null if no hint is available.
+     */
+    private String probeConnectHint() {
+        try {
+            Socket s = new Socket();
+            int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
+            s.connect(new InetSocketAddress(host, port), to);
+            try { s.close(); } catch (Exception ignored) {}
+            return null;
+        } catch (Exception ex) {
+            return hintFromConnectFailure(ex);
+        }
     }
 
     /**

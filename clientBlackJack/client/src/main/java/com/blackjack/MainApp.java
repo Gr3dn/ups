@@ -470,6 +470,20 @@ public class MainApp extends Application {
                     gameView.onBust(player, value);
                 });
             }
+            @Override public void onOpponentDisconnected(String player, int seconds) {
+                Platform.runLater(() -> {
+                    if (gameView != null) {
+                        gameView.onOpponentDisconnected(player, seconds);
+                    }
+                });
+            }
+            @Override public void onOpponentReconnected(String player) {
+                Platform.runLater(() -> {
+                    if (gameView != null) {
+                        gameView.onOpponentReconnected(player);
+                    }
+                });
+            }
             @Override public void onResult(String summary) {
                 Platform.runLater(() -> {
                     createGameView();

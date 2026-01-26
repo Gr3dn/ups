@@ -150,8 +150,6 @@ static void server_notify_and_disconnect_all(const char* reason) {
 static int is_bind_ip_available(const char* bind_ip) {
     struct ifaddrs* ifaddr = NULL;
 
-    // INADDR_ANY: treat "network is gone" as "no non-loopback IPv4 interface is UP".
-    // If you want a local-only server that doesn't depend on external network state, bind to "localhost".
     if (!bind_ip || strcmp(bind_ip, "0.0.0.0") == 0) {
         if (getifaddrs(&ifaddr) != 0) return 1; // best-effort: assume OK if we can't query
         int ok = 0;
@@ -894,6 +892,9 @@ game_wait:
 	            }
 	            if (is_token(line, "C45PONG")) continue;
 	            if (strncmp(line, "C45YES", 6) == 0) continue;
+                // Late/stale game commands can arrive after the match ends (race between UI clicks and
+                // server finishing the game). Ignore them and keep waiting for "<name>back".
+                if (is_token(line, "C45HIT") || is_token(line, "C45STAND")) continue;
 	            int br = is_back_request_for(line, name);
 	            if (br == 1) break;
             // Any other line after game end is a protocol error.

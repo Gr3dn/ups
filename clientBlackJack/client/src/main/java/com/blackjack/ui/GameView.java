@@ -22,7 +22,7 @@ import javafx.scene.layout.*;
  *
  * Table of contents:
  *   - Lifecycle: GameView(), scene(), bindClient()
- *   - Protocol callbacks: onDeal(), onTurn(), onCard(), onBust(), onResult()
+ *   - Protocol callbacks: onDeal(), onTurn(), onCard(), onBust(), onOpponentDisconnected(), onOpponentReconnected(), onResult()
  *   - UI helpers: setTurnEnabled(), setBackEnabled(), append()
  *   - Hand helpers: addCardToHand(), updateScore(), handValue()
  */
@@ -38,6 +38,7 @@ public class GameView {
     private Runnable onBackToLobby;
     private String myName;
     private final List<String> hand = new ArrayList<>();
+    private boolean matchEnded = false;
 
     /**
      * Create a game view for a given lobby number.
@@ -94,7 +95,9 @@ public class GameView {
      * @param c2 Second card.
      */
     public void onDeal(String c1, String c2){
+        matchEnded = false;
         setBackEnabled(false);
+        backToLobby.setText("Back to Lobby");
         hand.clear();
         addCardToHand(c1);
         addCardToHand(c2);
@@ -110,6 +113,12 @@ public class GameView {
      */
     public void onTurn(String who, int sec){
         append("Move: " + who + " (" + sec + "s)");
+        if (!matchEnded) {
+            // If we previously offered "Leave Lobby" while the opponent was disconnected,
+            // hide it once the game continues (a new turn indicates the match is running again).
+            setBackEnabled(false);
+            backToLobby.setText("Back to Lobby");
+        }
         setTurnEnabled(myName != null && myName.equals(who));
     }
 
@@ -140,11 +149,49 @@ public class GameView {
     }
 
     /**
+     * Handle notification that the opponent disconnected during the match.
+     *
+     * The match is paused on the server for a limited time, so we offer a way
+     * to leave the lobby and return to the lobby list.
+     *
+     * @param opponent Opponent name.
+     * @param seconds  Max time server waits for reconnect.
+     */
+    public void onOpponentDisconnected(String opponent, int seconds) {
+        matchEnded = false;
+        setTurnEnabled(false);
+        backToLobby.setText("Leave Lobby");
+        setBackEnabled(true);
+        String who = (opponent == null || opponent.isBlank()) ? "Opponent" : opponent;
+        append(who + " disconnected. Waiting up to " + seconds + " seconds...");
+    }
+
+    /**
+     * Handle notification that the opponent reconnected and the match continues.
+     *
+     * @param opponent Opponent name.
+     */
+    public void onOpponentReconnected(String opponent) {
+        matchEnded = false;
+        String who = (opponent == null || opponent.isBlank()) ? "Opponent" : opponent;
+        append(who + " reconnected. Continuing the game.");
+        backToLobby.setText("Back to Lobby");
+        setBackEnabled(false);
+    }
+
+    /**
      * Handle match result notification.
      *
      * @param s Summary string.
      */
-    public void onResult(String s){ System.out.println(s); append("Result: " + s); setTurnEnabled(false); setBackEnabled(true); }
+    public void onResult(String s){
+        matchEnded = true;
+        System.out.println(s);
+        append("Result: " + s);
+        setTurnEnabled(false);
+        backToLobby.setText("Back to Lobby");
+        setBackEnabled(true);
+    }
 
     /**
      * Enable or disable the HIT/STAND buttons.

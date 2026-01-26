@@ -490,7 +490,6 @@ static int drain_nonactive_player_input(Lobby* L,
                 pthread_mutex_unlock(&L->mtx);
                 if (is_back_request_for_name(line, other_name) == 1) {
                     active_name_mark_back(other_name, other_fd);
-                    player_disconnect_fd(L, other_idx);
                     *forced_winner_idx = active_idx;
                     return 1;
                 }

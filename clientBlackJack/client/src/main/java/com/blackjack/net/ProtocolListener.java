@@ -72,6 +72,23 @@ public interface ProtocolListener {
     default void onBust(String player, int value){ }
 
     /**
+     * Called when the opponent disconnects during a running game.
+     *
+     * The server will keep the match paused for up to {@code seconds} to allow the opponent to reconnect.
+     *
+     * @param player  Opponent name.
+     * @param seconds Max time to wait for reconnect.
+     */
+    default void onOpponentDisconnected(String player, int seconds){ }
+
+    /**
+     * Called when the opponent reconnects and the match continues.
+     *
+     * @param player Opponent name.
+     */
+    default void onOpponentReconnected(String player){ }
+
+    /**
      * Called when the match result is received.
      *
      * @param summary Human-readable summary prepared by the client.
