@@ -159,6 +159,7 @@ static int is_bind_ip_available(const char* bind_ip) {
             if (!ifa->ifa_addr) continue;
             if (ifa->ifa_addr->sa_family != AF_INET) continue;
             if (!(ifa->ifa_flags & IFF_UP)) continue;
+            if (!(ifa->ifa_flags & IFF_RUNNING)) continue;
             if (ifa->ifa_flags & IFF_LOOPBACK) continue;
             ok = 1;
             break;
@@ -179,6 +180,7 @@ static int is_bind_ip_available(const char* bind_ip) {
         if (!ifa->ifa_addr) continue;
         if (ifa->ifa_addr->sa_family != AF_INET) continue;
         if (!(ifa->ifa_flags & IFF_UP)) continue;
+        if (!(ifa->ifa_flags & IFF_RUNNING)) continue;
 
         struct sockaddr_in* sa = (struct sockaddr_in*)ifa->ifa_addr;
         if (sa->sin_addr.s_addr == target.s_addr) {
