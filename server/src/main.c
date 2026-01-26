@@ -1,3 +1,19 @@
+/*
+ * main.c
+ *
+ * Purpose:
+ *   CLI entry point for the Blackjack TCP server.
+ *
+ * Responsibilities:
+ *   - Parse CLI options and config.txt.
+ *   - Initialize lobbies and start the server loop.
+ *
+ * Table of contents:
+ *   - CLI parsing: parse_cli_net(), parse_port_strict(), is_ip_valid()
+ *   - Config parsing: parse_config_net()
+ *   - Entry point: main()
+ */
+
 #include "server.h"
 #include "game.h"
 #include <arpa/inet.h>
@@ -6,6 +22,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/**
+ * Print CLI usage help.
+ *
+ * @param prog Program name (argv[0]).
+ */
 static void print_help(const char* prog) {
     printf("Usage:\n");
     printf("  %s [-i IP] [-p PORT]\n", prog);
@@ -23,6 +44,13 @@ static void print_help(const char* prog) {
     printf("  - If config.txt IP/PORT are invalid, defaults are used.\n");
 }
 
+/**
+ * Parse a TCP port string strictly (digits only) and validate range.
+ *
+ * @param s        Input string.
+ * @param out_port Output port value.
+ * @return 0 on success; -1 on invalid format/range.
+ */
 static int parse_port_strict(const char* s, int* out_port) {
     if (!s || !*s) return -1;
     char* end = NULL;
@@ -34,6 +62,12 @@ static int parse_port_strict(const char* s, int* out_port) {
     return 0;
 }
 
+/**
+ * Validate an IPv4 address string or "localhost".
+ *
+ * @param ip Input string.
+ * @return 1 if valid; 0 otherwise.
+ */
 static int is_ip_valid(const char* ip) {
     if (!ip || !*ip) return 0;
     if (strcmp(ip, "localhost") == 0) return 1;
@@ -41,6 +75,12 @@ static int is_ip_valid(const char* ip) {
     return inet_pton(AF_INET, ip, &tmp) == 1;
 }
 
+/**
+ * Set global server bind address and port.
+ *
+ * @param ip   Bind address.
+ * @param port Bind port.
+ */
 static void set_server_net(const char* ip, int port) {
     snprintf(g_server_ip, sizeof(g_server_ip), "%s", ip);
     g_server_port = port;
@@ -67,7 +107,19 @@ typedef struct {
     int  port;
 } ConfigNet;
 
-// Returns: 0=ok, -1=fatal error (unknown option)
+/**
+ * Parse CLI IP/port options.
+ *
+ * Supported forms:
+ *   - "-i IP -p PORT"
+ *   - legacy positional port: "./blackjack_server 10000"
+ *
+ * @param argc CLI argc.
+ * @param argv CLI argv.
+ * @param out  Output structure (always initialized).
+ *
+ * @return 0 on success; -1 on fatal error (unknown option).
+ */
 static int parse_cli_net(int argc, char** argv, CliNet* out) {
     memset(out, 0, sizeof(*out));
 
@@ -126,6 +178,12 @@ static int parse_cli_net(int argc, char** argv, CliNet* out) {
     return 0;
 }
 
+/**
+ * Parse config file (config.txt) for IP and PORT.
+ *
+ * @param filename Config file path.
+ * @param out      Output structure (always initialized).
+ */
 static void parse_config_net(const char* filename, ConfigNet* out) {
     memset(out, 0, sizeof(*out));
 
@@ -162,6 +220,13 @@ static void parse_config_net(const char* filename, ConfigNet* out) {
     out->ok = 1;
 }
 
+/**
+ * Server executable entry point.
+ *
+ * @param argc CLI argc.
+ * @param argv CLI argv.
+ * @return Process exit code.
+ */
 int main(int argc, char** argv) {
     // Help must not depend on config.txt (and should not start the server).
     for (int i = 1; i < argc; ++i) {

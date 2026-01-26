@@ -1,3 +1,22 @@
+/*
+ * game.c
+ *
+ * Purpose:
+ *   Core game logic and lobby management for the Blackjack server.
+ *
+ * Responsibilities:
+ *   - Load configuration (lobby count, bind IP/port).
+ *   - Manage lobby lifecycle (add/remove players, attach fds, start game threads).
+ *   - Run the actual Blackjack match between two players in a lobby thread.
+ *   - Handle disconnects and reconnects during a running game.
+ *
+ * Table of contents:
+ *   - Configuration: load_config()
+ *   - Lobby lifecycle: lobbies_init(), lobbies_free(), lobby_try_add_player(), lobby_remove_player_by_name(), lobby_attach_fd()
+ *   - Game helpers: hand_value(), card_to_str(), deck_*()
+ *   - Game thread: lobby_game_thread() and reconnect helpers
+ */
+
 #include "game.h"
 #include "protocol.h"
 #include "server.h"
@@ -20,6 +39,16 @@ int    g_lobby_count = 5; // default value
 atomic_int g_server_running = 1;
 static void* lobby_game_thread(void* arg);
 
+/**
+ * Check whether a received line matches a protocol token exactly.
+ *
+ * This avoids prefix collisions by requiring the token to be followed by
+ * end-of-string or whitespace.
+ *
+ * @param line Full received line (NUL-terminated).
+ * @param tok  Token string to match (e.g. "C45PING").
+ * @return 1 if @p line begins with @p tok and is followed by end/whitespace; 0 otherwise.
+ */
 static int is_token(const char* line, const char* tok) {
     if (!line || !tok) return 0;
     size_t n = strlen(tok);
@@ -32,6 +61,11 @@ static int is_token(const char* line, const char* tok) {
 char g_server_ip[64] = "0.0.0.0";
 int  g_server_port   = 10000;
 /* --------- Deck ---------- */
+/**
+ * Initialize a deck in a known ordered state.
+ *
+ * @param d Deck to initialize.
+ */
 void deck_init(Deck *d) {
     int idx = 0;
     for (int s = 0; s < 4; ++s) {
@@ -44,6 +78,11 @@ void deck_init(Deck *d) {
     d->top = 0;
 }
 
+/**
+ * Shuffle a deck in-place.
+ *
+ * @param d Deck to shuffle.
+ */
 void deck_shuffle(Deck *d) {
     for (int i = DECK_SIZE - 1; i > 0; --i) {
         int j = rand() % (i + 1);
@@ -54,6 +93,12 @@ void deck_shuffle(Deck *d) {
     d->top = 0;
 }
 
+/**
+ * Draw one card from the deck (auto-shuffles when exhausted).
+ *
+ * @param d Deck to draw from.
+ * @return Drawn card.
+ */
 Card deck_draw(Deck *d) {
     if (d->top >= DECK_SIZE) {
         deck_shuffle(d);
@@ -62,6 +107,19 @@ Card deck_draw(Deck *d) {
 }
 
 /* --------- Lobbies ---------- */
+/**
+ * Load runtime configuration from a text file.
+ *
+ * Recognized keys:
+ *   - LOBBY_COUNT (1..1000)
+ *   - PORT (1..65535)
+ *   - IP (bind address; "0.0.0.0" binds on all interfaces)
+ *
+ * Missing file is not considered an error; defaults remain in effect.
+ *
+ * @param filename Path to config file.
+ * @return 0 always (kept for backward compatibility).
+ */
 int load_config(const char* filename) {
     FILE* f = fopen(filename, "r");
     if (!f) {
@@ -96,6 +154,13 @@ int load_config(const char* filename) {
 }
 
 
+/**
+ * Allocate and initialize the global lobby array.
+ *
+ * Uses @p g_lobby_count for the size and initializes decks, mutexes and player slots.
+ *
+ * @return 0 on success; -1 on allocation failure.
+ */
 int lobbies_init(void) {
     srand((unsigned)time(NULL));
 
@@ -125,6 +190,13 @@ int lobbies_init(void) {
 }
 
 
+/**
+ * Try to add a player into a lobby.
+ *
+ * @param lobby_index Zero-based lobby index.
+ * @param name        Player name.
+ * @return 0 on success; -1 on error (invalid lobby or lobby is full).
+ */
 int lobby_try_add_player(int lobby_index, const char* name) {
     if (lobby_index < 0 || lobby_index >= g_lobby_count) return -1;
 
@@ -157,6 +229,11 @@ int lobby_try_add_player(int lobby_index, const char* name) {
     return -1;
 }
 
+/**
+ * Remove a player from the lobby pool by name (first match wins).
+ *
+ * @param name Player name.
+ */
 void lobby_remove_player_by_name(const char* name) {
     for (int i = 0; i < g_lobby_count; ++i) {
         Lobby* L = &g_lobbies[i];
@@ -178,6 +255,15 @@ void lobby_remove_player_by_name(const char* name) {
     }
 }
 
+/**
+ * Compute the Blackjack value of a hand.
+ *
+ * Aces count as 11 until the total exceeds 21; then they count as 1.
+ *
+ * @param hand Array of cards.
+ * @param n    Number of cards in @p hand.
+ * @return Hand value.
+ */
 int hand_value(const Card* hand, int n) {
     int sum = 0, aces = 0;
     for (int i = 0; i < n; ++i) {
@@ -190,6 +276,14 @@ int hand_value(const Card* hand, int n) {
     return sum;
 }
 
+/**
+ * Convert a card to a two-character string representation.
+ *
+ * Output examples: "AS", "TD", "7H".
+ *
+ * @param c   Card to format.
+ * @param out Output buffer of size 3 (two chars + '\0').
+ */
 void card_to_str(Card c, char out[3]) {
     static const char R[] = "A23456789TJQK";
     static const char S[] = "CDHS"; // CLUBS,DIAMONDS,HEARTS,SPADES
@@ -198,6 +292,14 @@ void card_to_str(Card c, char out[3]) {
     out[2] = '\0';
 }
 
+/**
+ * Attach a socket fd to a lobby player by name.
+ *
+ * @param li   Zero-based lobby index.
+ * @param name Player name.
+ * @param fd   Connected socket file descriptor.
+ * @return 0 on success; -1 if no such player/lobby.
+ */
 int lobby_attach_fd(int li, const char* name, int fd) {
     if (li < 0 || li >= g_lobby_count) return -1;
     Lobby* L = &g_lobbies[li];
@@ -214,6 +316,12 @@ int lobby_attach_fd(int li, const char* name, int fd) {
     return -1;
 }
 
+/**
+ * Start the lobby game thread if the lobby is full and not already running.
+ *
+ * @param li Zero-based lobby index.
+ * @return 0 on success.
+ */
 int start_game_if_ready(int li) {
     Lobby* L = &g_lobbies[li];
     pthread_mutex_lock(&L->mtx);
@@ -228,6 +336,12 @@ int start_game_if_ready(int li) {
     return 0;
 }
 
+/**
+ * Mark a player as disconnected and close its socket fd (if any).
+ *
+ * @param L            Lobby.
+ * @param player_index Player slot index within the lobby.
+ */
 static void player_disconnect_fd(Lobby* L, int player_index) {
     int old_fd = -1;
     pthread_mutex_lock(&L->mtx);
@@ -237,6 +351,13 @@ static void player_disconnect_fd(Lobby* L, int player_index) {
     if (old_fd >= 0) close(old_fd);
 }
 
+/**
+ * Send the current hand state to a reconnected player.
+ *
+ * @param fd        Connected socket file descriptor.
+ * @param hand      Array of cards.
+ * @param hand_size Number of cards in @p hand.
+ */
 static void send_hand_snapshot(int fd, const Card* hand, int hand_size) {
     if (fd < 0) return;
     if (hand_size < 2) return;
@@ -255,6 +376,19 @@ static void send_hand_snapshot(int fd, const Card* hand, int hand_size) {
     }
 }
 
+/**
+ * Check whether a line is a "back to lobby" request for a specific player.
+ *
+ * Expected format:
+ *   "C45<name>back\n"
+ *
+ * @param line          Full received line.
+ * @param expected_name Player name to match.
+ *
+ * @return  1 Line matches a valid back request for @p expected_name.
+ * @return  0 Line is not a back request.
+ * @return -1 Line looks like a back request but for another name or invalid.
+ */
 static int is_back_request_for_name(const char* line, const char* expected_name) {
     if (!line || !expected_name || expected_name[0] == '\0') return 0;
     if (strncmp(line, "C45", 3) != 0) return 0;
@@ -286,9 +420,26 @@ static int is_back_request_for_name(const char* line, const char* expected_name)
     return (strncmp(tmp, expected_name, MAX_NAME_LEN) == 0) ? 1 : -1;
 }
 
-// Reads and handles any pending input from the non-active player during a turn.
-// Returns: 0=ok, 1=protocol violation -> end game (forced_winner_idx is set),
-//         -1=disconnect/error -> pause and wait for reconnect.
+/**
+ * Read and handle any pending input from the non-active player during a turn.
+ *
+ * This is used to:
+ *   - process keep-alives (PING/PONG),
+ *   - allow "back to lobby",
+ *   - detect protocol violations while out-of-turn.
+ *
+ * @param L                 Lobby.
+ * @param other_idx         Index of the non-active player.
+ * @param other_fd          Socket fd of the non-active player.
+ * @param active_idx        Index of the active player.
+ * @param forced_winner_idx Output: set to the winner index on protocol violation.
+ * @param inbuf             Per-player buffer with pending bytes.
+ * @param inlen             In/out: current size of @p inbuf.
+ *
+ * @return  0 OK.
+ * @return  1 Protocol violation; caller should end the game (winner is set).
+ * @return -1 Disconnect/error; caller should pause and wait for reconnect.
+ */
 static int drain_nonactive_player_input(Lobby* L,
                                         int other_idx,
                                         int other_fd,
@@ -359,8 +510,20 @@ static int drain_nonactive_player_input(Lobby* L,
     }
 }
 
-// Waits up to RECONNECT_TIMEOUT_SEC for missing_idx to reconnect (fd != -1).
-// Returns: 0=reconnected, 1=timeout, -1=other player disconnected.
+/**
+ * Wait up to RECONNECT_TIMEOUT_SEC for a missing player to reconnect.
+ *
+ * While waiting, the remaining player is kept alive with PING/PONG and receives
+ * notifications about the opponent status.
+ *
+ * @param L           Lobby.
+ * @param missing_idx Index of the disconnected player.
+ * @param other_idx   Index of the connected player.
+ *
+ * @return  0 Player reconnected.
+ * @return  1 Timeout expired (treat as opponent lost).
+ * @return -1 The other player disconnected while waiting.
+ */
 static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
     char missing_name[MAX_NAME_LEN];
     char other_name[MAX_NAME_LEN];
@@ -433,6 +596,15 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
     }
 }
 
+/**
+ * Lobby game thread entry point.
+ *
+ * Runs a two-player Blackjack match, handles turn timeouts, keep-alive, and
+ * reconnects. When the match ends, it announces the result and resets lobby state.
+ *
+ * @param arg Pointer to heap-allocated int containing the lobby index.
+ * @return NULL.
+ */
 static void* lobby_game_thread(void* arg) {
     int li = *(int*)arg; free(arg);
     Lobby* L = &g_lobbies[li];
@@ -677,6 +849,12 @@ end_game:
     return NULL;
 }
 
+/**
+ * Check whether a player name exists in any lobby.
+ *
+ * @param name Player name.
+ * @return 1 if present; 0 otherwise.
+ */
 int lobby_name_exists(const char* name) {
     if (!name || !*name) return 0;
     for (int i = 0; i < g_lobby_count; ++i) {
@@ -695,6 +873,9 @@ int lobby_name_exists(const char* name) {
     return 0;
 }
 
+/**
+ * Free the global lobby array and destroy lobby mutexes.
+ */
 void lobbies_free(void) {
     if (!g_lobbies) return;
 

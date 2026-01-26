@@ -1,6 +1,13 @@
-# Protocol (short)
+# Protocol
 
 All messages are sent over TCP as text lines and must end with `\n`.
+
+## Contents
+- Connect
+- Lobby
+- Game
+- Keepalive
+- Basic server responses
 
 ## Connect (client -> server)
 - `C45<name>\n` — first handshake

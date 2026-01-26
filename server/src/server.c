@@ -1,3 +1,25 @@
+/*
+ * server.c
+ *
+ * Purpose:
+ *   TCP server implementation for the Blackjack project.
+ *
+ * Responsibilities:
+ *   - Accept client connections and run one thread per client.
+ *   - Perform handshake (name registration) and lobby selection.
+ *   - Start game threads when lobbies become full.
+ *   - Support keep-alive (PING/PONG) and reconnect into a running game.
+ *   - Maintain a global "active name" registry to prevent duplicates and to
+ *     coordinate "back to lobby" requests across threads.
+ *
+ * Table of contents:
+ *   - Signal handling: on_sigint()
+ *   - Active name registry: active_name_*()
+ *   - Parsing helpers: parse_name_only(), parse_name_lobby(), is_back_request_for()
+ *   - Client thread state machine: client_thread()
+ *   - Server loop: run_server()
+ */
+
 #define _GNU_SOURCE
 #include "server.h"
 #include "protocol.h"
@@ -29,6 +51,16 @@ static unsigned long long g_active_tokens[ACTIVE_MAX];
 static unsigned long long g_token_seq = 1;
 static int  g_active_cnt = 0;
 
+/**
+ * Check whether a received line matches a protocol token exactly.
+ *
+ * This prevents prefix collisions (e.g. a player name starting with "PING")
+ * by requiring the token to be followed by end-of-string or whitespace.
+ *
+ * @param line Full received line (NUL-terminated).
+ * @param tok  Token string to match (e.g. "C45PING").
+ * @return 1 if @p line begins with @p tok and is followed by end/whitespace; 0 otherwise.
+ */
 static int is_token(const char* line, const char* tok) {
     if (!line || !tok) return 0;
     size_t n = strlen(tok);
@@ -37,17 +69,34 @@ static int is_token(const char* line, const char* tok) {
     return (c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t');
 }
 
-/* --- Help --- */
+/* --- Signal handling --- */
+/**
+ * SIGINT handler: marks the server loop as stopped.
+ *
+ * @param sig Signal number (unused).
+ */
 static void on_sigint(int sig) {
     (void)sig;
     g_server_running = 0;
 }
 
+/**
+ * Check whether a player name exists in the active connection registry.
+ *
+ * @param n Player name.
+ * @return 1 if present; 0 otherwise.
+ */
 int active_name_has(const char* n) {
     for (int i = 0; i < g_active_cnt; ++i)
         if (strncmp(g_active_names[i], n, MAX_NAME_LEN) == 0) return 1;
     return 0;
 }
+/**
+ * Add a player name to the active connection registry.
+ *
+ * @param n Player name.
+ * @return 0 on success; -1 if the registry is full.
+ */
 int active_name_add(const char* n) {
     if (g_active_cnt >= ACTIVE_MAX) return -1;
     strncpy(g_active_names[g_active_cnt++], n, MAX_NAME_LEN);
@@ -57,6 +106,11 @@ int active_name_add(const char* n) {
     g_active_tokens[g_active_cnt-1] = 0;
     return 0;
 }
+/**
+ * Remove a player name from the active connection registry.
+ *
+ * @param n Player name.
+ */
 void active_name_remove(const char* n) {
     for (int i = 0; i < g_active_cnt; ++i) {
         if (strncmp(g_active_names[i], n, MAX_NAME_LEN) == 0) {
@@ -75,6 +129,12 @@ void active_name_remove(const char* n) {
     }
 }
 
+/**
+ * Find an index of a name in the active registry.
+ *
+ * @param n Player name.
+ * @return Index in internal arrays, or -1 if not found.
+ */
 static int active_name_find(const char* n) {
     for (int i = 0; i < g_active_cnt; ++i) {
         if (strncmp(g_active_names[i], n, MAX_NAME_LEN) == 0) return i;
@@ -82,6 +142,16 @@ static int active_name_find(const char* n) {
     return -1;
 }
 
+/**
+ * Update the socket fd for an active name and assign a new token.
+ *
+ * The token is used to prevent stale cleanup when the same name reconnects
+ * on a different socket.
+ *
+ * @param n  Player name (must exist in registry).
+ * @param fd Connected socket file descriptor.
+ * @return New token value, or 0 if the name is not found.
+ */
 static unsigned long long active_name_set_fd(const char* n, int fd) {
     int i = active_name_find(n);
     if (i >= 0) {
@@ -92,6 +162,12 @@ static unsigned long long active_name_set_fd(const char* n, int fd) {
     return 0;
 }
 
+/**
+ * Remove an active name only if its current token matches the provided token.
+ *
+ * @param n     Player name.
+ * @param token Token value previously returned by active_name_set_fd().
+ */
 static void active_name_remove_if_token(const char* n, unsigned long long token) {
     int i = active_name_find(n);
     if (i < 0) return;
@@ -99,6 +175,12 @@ static void active_name_remove_if_token(const char* n, unsigned long long token)
     active_name_remove(n);
 }
 
+/**
+ * Mark a pending "back to lobby" request for an active name.
+ *
+ * @param n  Player name.
+ * @param fd Optional socket fd for additional safety (pass -1 to ignore fd).
+ */
 void active_name_mark_back(const char* n, int fd) {
     if (!n || !*n) return;
     pthread_mutex_lock(&g_names_mtx);
@@ -109,6 +191,13 @@ void active_name_mark_back(const char* n, int fd) {
     pthread_mutex_unlock(&g_names_mtx);
 }
 
+/**
+ * Consume (clear) a pending "back to lobby" request.
+ *
+ * @param n  Player name.
+ * @param fd Optional socket fd for additional safety (pass -1 to ignore fd).
+ * @return 1 if a pending request was found and cleared; 0 otherwise.
+ */
 int active_name_take_back(const char* n, int fd) {
     if (!n || !*n) return 0;
     pthread_mutex_lock(&g_names_mtx);
@@ -121,6 +210,19 @@ int active_name_take_back(const char* n, int fd) {
     return ok;
 }
 
+/**
+ * Try to reattach a TCP connection to a player in a running lobby game.
+ *
+ * The reconnect is allowed only if:
+ *   - the lobby index is valid,
+ *   - the lobby is currently running,
+ *   - a matching player record exists with fd == -1 (previously disconnected).
+ *
+ * @param lobby_index Zero-based lobby index.
+ * @param name        Player name.
+ * @param fd          New connected socket file descriptor.
+ * @return 0 on success; -1 on failure.
+ */
 static int lobby_try_reconnect(int lobby_index, const char* name, int fd) {
     if (lobby_index < 0 || lobby_index >= g_lobby_count) return -1;
     if (!name || !*name) return -1;
@@ -146,56 +248,19 @@ static int lobby_try_reconnect(int lobby_index, const char* name, int fd) {
     return ok;
 }
 
-
-// /* Parsing the selection string: “C45<name><lobby>\n”
-//    Return: 0=OK (out_name and out_lobby are filled), -1=format/range error. */
-// static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, int* out_lobby) {
-//     if (!is_c45_prefix(line)) return -1;
-
-//     /* cut off “C45” and trailing \r\n and spaces */
-//     const char* s = line + 3;
-//     while (*s == ' ' || *s == '\t') s++;
-
-//     char tmp[READ_BUF];
-//     strncpy(tmp, s, sizeof(tmp)-1);
-//     tmp[sizeof(tmp)-1] = '\0';
-//     for (int i = (int)strlen(tmp)-1; i >=0 && (tmp[i]=='\r'||tmp[i]=='\n'||tmp[i]==' '||tmp[i]=='\t'); --i) {
-//         tmp[i] = '\0';
-//     }
-//     if (tmp[0] == '\0') return -2;
-
-//     /* remove the lobby number from the end */
-//     int len = (int)strlen(tmp);
-//     int pos = len - 1;
-//     if (pos < 0) return -3;
-
-//     /* collect lobby numbers in reverse order */
-//     int lobby = 0;
-//     int base = 1;
-//     int digits = 0;
-//     while (pos >= 0 && tmp[pos] >= '0' && tmp[pos] <= '9') {
-//         lobby = (tmp[pos] - '0') * base + lobby;
-//         base *= 10;
-//         digits++;
-//         pos--;
-//     }
-//     if (digits == 0) return -4; /* without a number */
-//     printf("%d", lobby);
-//     if (lobby < 1 || lobby > LOBBY_COUNT) return -5;
-
-//     /* name */
-//     while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) pos--;
-//     tmp[pos+1] = '\0'; /* cutting spaces */
-//     if (pos+1 <= 0) return -6;
-
-//     if ((int)strlen(tmp) >= out_name_sz) return -7;
-//     strcpy(out_name, tmp);
-//     *out_lobby = lobby;
-//     return 0;
-// }
-
-/* Parsing the selection string: “C45<name><lobby>\n”
-   Return: 0=OK (out_name and out_lobby are filled), -1=format/range error. */
+/**
+ * Parse a lobby selection line in the legacy format: "C45<name><lobby>\n".
+ *
+ * Note: for backward compatibility this parser treats ONLY the last digit as the lobby number.
+ * This means lobbies above 9 are not representable in this legacy command.
+ *
+ * @param line        Full received line.
+ * @param out_name    Output buffer for the extracted player name.
+ * @param out_name_sz Size of @p out_name in bytes.
+ * @param out_lobby   Output: parsed lobby number (1-based).
+ *
+ * @return 0 on success; negative value on parse/validation error.
+ */
 static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, int* out_lobby) {
     if (!is_c45_prefix(line)) return -1;
 
@@ -207,28 +272,28 @@ static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, i
     strncpy(tmp, s, sizeof(tmp)-1);
     tmp[sizeof(tmp)-1] = '\0';
 
-    // убираем \r \n и пробелы с конца
+    // Trim trailing CR/LF and whitespace.
     for (int i = (int)strlen(tmp)-1; i >= 0 &&
              (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
         tmp[i] = '\0';
     }
     if (tmp[0] == '\0') return -2;
 
-    /* берем ТОЛЬКО последнюю цифру как номер лобби */
+    /* Legacy format: use ONLY the last digit as the lobby number. */
     int len = (int)strlen(tmp);
     int pos = len - 1;
     if (pos < 0) return -3;
 
-    // последняя значащая позиция должна быть цифрой
-    if (tmp[pos] < '0' || tmp[pos] > '9') return -4;  // нет цифры в конце
+    // The last non-whitespace character must be a digit.
+    if (tmp[pos] < '0' || tmp[pos] > '9') return -4;  // no digit at the end
 
     int lobby = tmp[pos] - '0';
-    tmp[pos] = '\0';          // отрезаем цифру лобби
+    tmp[pos] = '\0';          // cut the lobby digit
     pos--;
 
     if (lobby < 1 || lobby > g_lobby_count) return -5;
 
-    /* теперь в tmp осталось только имя (с возможными пробелами в конце) */
+    /* Now tmp contains only the name (may still have trailing whitespace). */
     while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) {
         tmp[pos] = '\0';
         pos--;
@@ -245,8 +310,14 @@ static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, i
     return 0;
 }
 
-/* Parsing a client name line: "C45<name>\n"
-   Return: 0=OK, <0=error. */
+/**
+ * Parse a client name line in the format: "C45<name>\n".
+ *
+ * @param line        Full received line.
+ * @param out_name    Output buffer for the extracted name.
+ * @param out_name_sz Size of @p out_name in bytes.
+ * @return 0 on success; negative value on parse/validation error.
+ */
 static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
     if (!is_c45_prefix(line)) return -1;
 
@@ -271,8 +342,19 @@ static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
     return 0;
 }
 
-/* Checks "C45<name>back\n" for a specific expected name.
-   Return: 1=match, 0=not a back request, -1=back request with other name/bad. */
+/**
+ * Check whether a line is a "back to lobby" request for a specific name.
+ *
+ * Expected format:
+ *   "C45<name>back\n"
+ *
+ * @param line          Full received line.
+ * @param expected_name Player name to match.
+ *
+ * @return  1 Line matches a valid back request for @p expected_name.
+ * @return  0 Line is not a back request.
+ * @return -1 Line looks like a back request but for another name or invalid.
+ */
 static int is_back_request_for(const char* line, const char* expected_name) {
     if (!is_c45_prefix(line)) return 0;
     if (!expected_name || expected_name[0] == '\0') return 0;
@@ -304,6 +386,12 @@ static int is_back_request_for(const char* line, const char* expected_name) {
     return (strncmp(tmp, expected_name, MAX_NAME_LEN) == 0) ? 1 : -1;
 }
 
+/**
+ * Busy-wait until a lobby changes its running state.
+ *
+ * @param lobby_index    Zero-based lobby index.
+ * @param target_running Desired boolean state (0 or 1).
+ */
 static void wait_lobby_running_change(int lobby_index, int target_running) {
     for (;;) {
         pthread_mutex_lock(&g_lobbies[lobby_index].mtx);
@@ -315,7 +403,15 @@ static void wait_lobby_running_change(int lobby_index, int target_running) {
 }
 
 
-/* Client stream */
+/**
+ * Per-client thread entry point.
+ *
+ * This function runs the complete client state machine:
+ * handshake -> lobby selection -> waiting/game -> post-game.
+ *
+ * @param arg Socket fd passed as (void*)(intptr_t)fd.
+ * @return NULL.
+ */
 static void* client_thread(void* arg) {
     int cfd = (int)(intptr_t)arg;
     printf("[NET] Client start (fd=%d)\n", cfd);
@@ -662,6 +758,15 @@ disconnect:
     return NULL;
 }
 
+/**
+ * Start the TCP server accept loop and spawn a thread per client.
+ *
+ * The loop runs until @p g_server_running becomes 0 (SIGINT).
+ *
+ * @param bind_ip Bind address (NULL/"0.0.0.0" binds on all interfaces; "localhost" uses loopback).
+ * @param port    TCP port to listen on.
+ * @return 0 on normal shutdown; non-zero on fatal error.
+ */
 int run_server(const char* bind_ip, int port) {
     signal(SIGINT, on_sigint);
     signal(SIGPIPE, SIG_IGN);

@@ -6,6 +6,22 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
+/**
+ * NetClient
+ *
+ * Purpose:
+ *   TCP client for the Blackjack server protocol.
+ *
+ * Responsibilities:
+ *   - Maintain a socket connection and a background reader thread.
+ *   - Parse server messages and dispatch them to a {@link ProtocolListener}.
+ *   - Send client commands (name, lobby join, game actions).
+ *   - Perform keep-alive (PING/PONG) and best-effort reconnect.
+ *
+ * Threading:
+ *   - {@link #startReader(ProtocolListener)} spawns a daemon thread that performs blocking reads.
+ *   - {@link #sendRaw(String)} is synchronized to serialize socket writes.
+ */
 public class NetClient {
     private final String host;
     private final int port;
@@ -48,6 +64,14 @@ public class NetClient {
         ProtocolException(String message) { super(message); }
     }
 
+    /**
+     * Create a NetClient around an already-connected socket.
+     *
+     * @param s         Connected socket.
+     * @param host      Host used for reconnect attempts.
+     * @param port      Port used for reconnect attempts.
+     * @param timeoutMs Connect timeout for new connections.
+     */
     private NetClient(Socket s, String host, int port, int timeoutMs) throws IOException {
         this.host = host;
         this.port = port;
@@ -55,12 +79,31 @@ public class NetClient {
         replaceConnection(s);
     }
 
+    /**
+     * Connect to a server and create a {@link NetClient}.
+     *
+     * @param host      Server host/IP.
+     * @param port      Server port.
+     * @param timeoutMs Connect timeout in milliseconds.
+     * @return Connected NetClient instance.
+     */
     public static NetClient connect(String host, int port, int timeoutMs) throws IOException {
         Socket s = new Socket();
         s.connect(new InetSocketAddress(host, port), timeoutMs);
         return new NetClient(s, host, port, timeoutMs);
     }
 
+    /**
+     * Start the background reader thread (idempotent).
+     *
+     * The reader thread:
+     *   - reads server lines,
+     *   - maintains heartbeat state,
+     *   - dispatches events to the provided listener,
+     *   - may attempt to reconnect on failures.
+     *
+     * @param l Listener that receives parsed protocol events.
+     */
     public synchronized void startReader(ProtocolListener l) {
         if (reader != null && reader.isAlive()) return;
         reader = new Thread(() -> {
@@ -69,7 +112,6 @@ public class NetClient {
             while (!closing) {
                 try {
                     String line = br.readLine();
-                    System.out.println(line);
                     if (line == null){
                         throw new EOFException("server closed");
                         }
@@ -113,16 +155,6 @@ public class NetClient {
                         throw new ProtocolException("Bad server message (no C45 prefix): " + t);
                     }
 
-                    // C45LL... parsing
-//                    String framed = null;
-//                    try { framed = tryParseC45Frame(t); }
-//                    catch (IOException bad) { l.onServerError(bad.getMessage()); break; }
-//
-//                    if (framed != null) {
-//                        t = coerceToLegacyToken(framed);
-//                    }
-
-                    // базовые токены
                     if (t.startsWith("C45OK")) {
                         if (state == State.WAIT_OK) {
                             ensureState(t, State.WAIT_OK);
@@ -150,7 +182,7 @@ public class NetClient {
                         return;
                     }
 
-                    // снимок лобби: "C45LOBBIES N" + N строк "C45LOBBY ..."
+                    // Lobby snapshot
                     if (t.startsWith("C45LOBBIES")) {
                         if (!expectLobbySnapshot && state != State.WAIT_LOBBIES) {
                             throw new ProtocolException("Unexpected lobby snapshot: " + t);
@@ -171,7 +203,7 @@ public class NetClient {
                         continue;
                     }
 
-                    // игровая часть
+                    // gameplay
                     if (t.startsWith("C45DEAL")) {
                         String[] p = t.split("\\s+");
                         if (p.length < 3) throw new ProtocolException("Bad C45DEAL: " + t);
@@ -287,7 +319,7 @@ public class NetClient {
                     if (closing) return;
                     if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
                     if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
-                        l.onServerError("Unable to restore connection within " + (RECONNECT_WINDOW_MS / 1000) + " seconds. Please reconnect manually.");
+                        l.onServerError("Unable to restore connection within " + (RECONNECT_WINDOW_MS / 1000) + " seconds.");
                     } else {
                         l.onServerError(ex.getMessage());
                     }
@@ -299,10 +331,23 @@ public class NetClient {
         reader.start();
     }
 
-    // отправка команд
+    /* --- Client -> server commands --- */
+    /**
+     * Send a raw text line to the server.
+     *
+     * The line must include the trailing {@code \n} according to the server protocol.
+     *
+     * @param s Line to send.
+     */
     public synchronized void sendRaw(String s) throws IOException {
         System.out.println(s);
         os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
+
+    /**
+     * Send the initial handshake containing the player name.
+     *
+     * @param name Player name (must not contain whitespace).
+     */
     public void sendName(String name) throws IOException {
         lastName = name;
         handshakeDone = false;
@@ -311,7 +356,13 @@ public class NetClient {
         expectLobbySnapshot = true;
         sendRaw("C45" + name + "\n");
     }
-    // Совместимо с твоим текущим форматом "C45<name><lobby>"
+
+    /**
+     * Send a lobby join request using the legacy command format: {@code C45<name><lobby>\n}.
+     *
+     * @param name  Player name.
+     * @param lobby 1-based lobby number.
+     */
     public void sendJoin(String name, int lobby) throws IOException {
         lastName = name;
         lastLobby = lobby;
@@ -319,17 +370,34 @@ public class NetClient {
         sendRaw("C45" + name + lobby + "\n");
         System.out.println(lobby);
     }
-    // Если перейдёшь на явную команду: sendRaw("C45JOIN " + lobby + "\n");
+
+    /** Send {@code C45HIT}. */
     public void sendHit() throws IOException { sendRaw("C45HIT\n"); }
+    /** Send {@code C45STAND}. */
     public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
+    /** Send {@code C45YES}. */
     public void sendYes() throws IOException { sendRaw("C45YES\n"); }
+    /** Send {@code C45PONG}. */
     public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
+    /** Send {@code C45PING}. */
     public void sendPing() throws IOException { sendRaw("C45PING\n"); }
+
+    /**
+     * Request going back to lobby list.
+     *
+     * @param name Player name.
+     */
     public void sendBackToLobby(String name) throws IOException {
         expectLobbySnapshot = true;
         sendRaw("C45" + (name == null ? "" : name) + "back\n");
     }
 
+    /**
+     * Explicitly request a reconnect on the server.
+     *
+     * @param name  Player name.
+     * @param lobby 1-based lobby number.
+     */
     public void sendReconnect(String name, int lobby) throws IOException {
         if (name == null) name = "";
         lastName = name;
@@ -341,13 +409,9 @@ public class NetClient {
         sendRaw("C45RECONNECT " + name + " " + lobby + "\n");
     }
 
-//    public void sendName(String name) throws IOException { sendRaw(buildC45Frame(name)); }
-//    // "C45<name><lobby>" как и было — но в payload
-//    public void sendJoin(String name, int lobby) throws IOException { sendRaw(buildC45Frame(name + lobby)); }
-//    public void sendHit() throws IOException { sendRaw(buildC45Frame("HIT")); }
-//    public void sendStand() throws IOException { sendRaw(buildC45Frame("STAND")); }
-//    public void sendYes() throws IOException { sendRaw(buildC45Frame("YES")); }
-
+    /**
+     * Close the socket and stop the reader thread (best effort).
+     */
     public void closeQuietly() {
         // Close socket first to unblock reader thread; closing BufferedReader can block on its internal lock.
         closing = true;
@@ -355,6 +419,11 @@ public class NetClient {
         try { if (reader != null) reader.interrupt(); } catch (Exception ignored) {}
     }
 
+    /**
+     * Replace the current connection with a new socket and reset per-connection state.
+     *
+     * @param s Connected socket.
+     */
     private synchronized void replaceConnection(Socket s) throws IOException {
         try { if (socket != null) socket.close(); } catch (Exception ignored) {}
         s.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
@@ -367,6 +436,12 @@ public class NetClient {
         lastPingMs = 0L;
     }
 
+    /**
+     * Try to reconnect within the given time window.
+     *
+     * @param windowMs Max time spent reconnecting.
+     * @return true if reconnection succeeded; false otherwise.
+     */
     private boolean tryReconnect(long windowMs) {
         String n = lastName;
         int lobby = lastLobby;
@@ -399,9 +474,15 @@ public class NetClient {
         return false;
     }
 
-
-
-    // перенос парсера строки лобби из MainApp
+    /**
+     * Parse a single lobby line from the server snapshot.
+     *
+     * Expected format:
+     *   {@code C45LOBBY <id> players=<n>/<cap> status=<0|1>}
+     *
+     * @param line Raw line (without trailing newline).
+     * @return Parsed {@link LobbyRow}.
+     */
     private LobbyRow parseLobbyLine(String line) throws ProtocolException {
         String[] parts = line.split("\\s+");
         if (parts.length != 4 || !parts[0].equalsIgnoreCase("C45LOBBY")) {
@@ -427,15 +508,34 @@ public class NetClient {
         return new LobbyRow(id, players, cap, status);
     }
 
+    /**
+     * Ensure the current client state matches the expected value.
+     *
+     * @param msg      Original message (used for error context).
+     * @param expected Expected state.
+     */
     private void ensureState(String msg, State expected) throws ProtocolException {
         if (state != expected) throw new ProtocolException("Bad client state for message: " + msg);
     }
 
+    /**
+     * Ensure the current client state is one of the allowed values.
+     *
+     * @param msg     Original message (used for error context).
+     * @param allowed Allowed states.
+     */
     private void ensureStateIn(String msg, State... allowed) throws ProtocolException {
         for (State s : allowed) if (state == s) return;
         throw new ProtocolException("Bad client state for message: " + msg);
     }
 
+    /**
+     * Parse a strictly positive integer (v > 0).
+     *
+     * @param s   Input string.
+     * @param ctx Context string used for error message.
+     * @return Parsed integer value.
+     */
     private static int parsePositiveInt(String s, String ctx) throws ProtocolException {
         try {
             int v = Integer.parseInt(s);
@@ -446,6 +546,13 @@ public class NetClient {
         }
     }
 
+    /**
+     * Parse a non-negative integer (v >= 0).
+     *
+     * @param s   Input string.
+     * @param ctx Context string used for error message.
+     * @return Parsed integer value.
+     */
     private static int parseNonNegativeInt(String s, String ctx) throws ProtocolException {
         try {
             int v = Integer.parseInt(s);
@@ -456,8 +563,14 @@ public class NetClient {
         }
     }
 
-    // --- C45 framed messages ---
+    /* --- C45 framed messages (optional) --- */
 
+    /**
+     * Build a framed C45 line: {@code C45LL<payload>\n}.
+     *
+     * @param payload Payload string (NULL is treated as empty).
+     * @return Full frame line.
+     */
     private static String buildC45Frame(String payload) {
         if (payload == null) payload = "";
         int len = payload.length();
@@ -465,7 +578,12 @@ public class NetClient {
         return String.format("C45%02d%s\n", len, payload);
     }
 
-    /** Возвращает payload, если строка — C45-кадр; иначе null. Бросает, если плохая длина. */
+    /**
+     * Try to parse a framed C45 line and return its payload.
+     *
+     * @param line Raw line (without trailing newline).
+     * @return Payload string if this is a valid frame; null if not a C45 frame.
+     */
     private static String tryParseC45Frame(String line) throws IOException {
         if (line == null || !line.startsWith("C45")) return null;
         if (line.length() < 5) throw new IOException("Bad C45 frame: too short");
@@ -478,7 +596,12 @@ public class NetClient {
         return payload;
     }
 
-    /** Совместимость: если кадр разобран — превратим в старый вид "C45..." (добавим префикс). */
+    /**
+     * Compatibility helper: convert a payload into the legacy token form ("C45" + payload).
+     *
+     * @param maybePayloadOrNull Parsed payload (or null).
+     * @return Legacy token string (or null).
+     */
     private static String coerceToLegacyToken(String maybePayloadOrNull) {
         if (maybePayloadOrNull == null) return null;
         return "C45" + maybePayloadOrNull;

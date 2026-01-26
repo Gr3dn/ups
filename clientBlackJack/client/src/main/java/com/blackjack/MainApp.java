@@ -22,19 +22,40 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
+/**
+ * MainApp
+ *
+ * Purpose:
+ *   JavaFX entry point for the Blackjack client UI.
+ *
+ * Responsibilities:
+ *   - Render connection/name/lobby/game screens.
+ *   - Wire UI actions to {@link com.blackjack.net.NetClient} commands.
+ *   - React to protocol events via {@link com.blackjack.net.ProtocolListener}.
+ *
+ * Table of contents:
+ *   - Scene builders: buildConnectScene(), buildNameScene(), buildLobbyChoiceScene(), buildLobbyWaitingScene()
+ *   - Protocol listener wiring: buildListener()
+ *   - Navigation helpers and lifecycle: goToConnectScene(), closeClient(), stop()
+ */
 public class MainApp extends Application {
 
-    // -------- Нетворк / состояние --------
+    /* --- Network/session state --- */
     private NetClient client;
     private String name;
     private int lastLobbySelected = -1;
     private String lastHost;
     private int lastPort;
 
-    // -------- UI --------
+    /* --- UI state --- */
     private Stage primaryStage;
-    private GameView gameView; // создаём при входе в лобби
+    private GameView gameView; // created when entering a lobby
 
+    /**
+     * JavaFX lifecycle entry point.
+     *
+     * @param stage Primary stage.
+     */
     @Override
     public void start(Stage stage) {
         this.primaryStage = stage;
@@ -43,13 +64,21 @@ public class MainApp extends Application {
         stage.show();
     }
 
-    // ---------- Модель строки лобби (используется NetClient) ----------
+    /* --- Lobby row model (used by NetClient) --- */
     public static class LobbyRow {
         private final IntegerProperty id = new SimpleIntegerProperty();
         private final IntegerProperty players = new SimpleIntegerProperty();
         private final IntegerProperty capacity = new SimpleIntegerProperty();
         private final StringProperty status = new SimpleStringProperty();
 
+        /**
+         * Create a lobby row model.
+         *
+         * @param id       Lobby id (1-based).
+         * @param players  Current player count.
+         * @param capacity Lobby capacity.
+         * @param status   Lobby status string from the server.
+         */
         public LobbyRow(int id, int players, int capacity, String status) {
             this.id.set(id);
             this.players.set(players);
@@ -57,17 +86,26 @@ public class MainApp extends Application {
             this.status.set(status);
         }
 
+        /** @return Lobby id (1-based). */
         public int getId() { return id.get(); }
+        /** @return Current player count. */
         public int getPlayers() { return players.get(); }
+        /** @return Lobby capacity. */
         public int getCapacity() { return capacity.get(); }
+        /** @return Lobby status string from the server. */
         public String getStatus() { return status.get(); }
     }
 
     // =================================================================
-    //                                СЦЕНЫ
+    //                                SCENES
     // =================================================================
 
-    // ---------- Подключение ----------
+    /**
+     * Build the initial connection scene (enter IP/port).
+     *
+     * @param msg Optional status message shown under the buttons.
+     * @return JavaFX scene.
+     */
     private Scene buildConnectScene(String msg) {
         TextField ipField = new TextField();
         ipField.setPromptText("Server IP (for example: 127.0.0.1)");
@@ -106,7 +144,7 @@ public class MainApp extends Application {
             new Thread(() -> {
                 try {
                     closeClient();
-                    client = NetClient.connect(ip, port, 5000);
+                    client = NetClient.connect(ip, port, 10000);
                     client.startReader(buildListener());
                     Platform.runLater(() -> {
                         primaryStage.setTitle("Blackjack Client — enter name");
@@ -185,7 +223,11 @@ public class MainApp extends Application {
         return new Scene(root, 460, 200);
     }
 
-    // ---------- Ввод имени ----------
+    /**
+     * Build the "enter nickname" scene.
+     *
+     * @return JavaFX scene.
+     */
     private Scene buildNameScene() {
         TextField nameField = new TextField();
         nameField.setPromptText("Your name");
@@ -216,7 +258,7 @@ public class MainApp extends Application {
             new Thread(() -> {
                 try {
                     if (client == null) throw new SocketException("Connection broke");
-                    // запускаем ридер С ПОДПИСАННЫМ listener'ом
+                    // Reader thread is started on connect; here we only send the name handshake.
                     client.sendName(name);
                 } catch (Exception ex) {
                     String reason = normalizeNetError(ex);
@@ -242,11 +284,21 @@ public class MainApp extends Application {
         return new Scene(root, 420, 160);
     }
 
-    // ---------- Ожидание снимка лобби ----------
+    /**
+     * Build a waiting scene shown while the client expects a lobby snapshot.
+     *
+     * @return JavaFX scene.
+     */
     private Scene buildLobbyWaitingScene() {
         return buildLobbyWaitingScene("Confirmed. Waiting for the lobby list from the server...");
     }
 
+    /**
+     * Build a waiting scene with a custom message.
+     *
+     * @param message Message shown above the progress indicator.
+     * @return JavaFX scene.
+     */
     private Scene buildLobbyWaitingScene(String message) {
         Label lbl = new Label(message == null ? "" : message);
         ProgressIndicator pi = new ProgressIndicator();
@@ -262,7 +314,12 @@ public class MainApp extends Application {
         return new Scene(root, 520, 260);
     }
 
-    // ---------- Выбор лобби ----------
+    /**
+     * Build the lobby selection scene.
+     *
+     * @param rows Lobby rows received from the server.
+     * @return JavaFX scene.
+     */
     private Scene buildLobbyChoiceScene(ObservableList<LobbyRow> rows) {
         VBox listBox = new VBox(8);
         listBox.setFillWidth(true);
@@ -307,10 +364,10 @@ public class MainApp extends Application {
             new Thread(() -> {
                 try {
                     if (client == null) throw new SocketException("Connection broke");
-                    // Совместимо с текущим сервером: "C45" + name + lobbyNum + "\n"
+                    // Compatible with the current server: "C45" + name + lobbyNum + "\n"
                     client.sendJoin(Objects.requireNonNullElse(name, ""), num);
                     Platform.runLater(() -> status.setText("Send: " + num));
-                    // Подтверждение входа придёт как onLobbyJoinOk() из listener
+                    // Join confirmation is delivered via onLobbyJoinOk() from the protocol listener.
                 } catch (Exception ex2) {
                     String reason = normalizeNetError(ex2);
                     System.out.println("build Lobby Choice");
@@ -341,9 +398,14 @@ public class MainApp extends Application {
     }
 
     // =================================================================
-    //                          LISTENER ПРОТОКОЛА
+    //                          PROTOCOL LISTENER
     // =================================================================
 
+    /**
+     * Build a {@link ProtocolListener} that updates the UI based on server messages.
+     *
+     * @return Listener instance.
+     */
     private ProtocolListener buildListener() {
         return new ProtocolListener() {
             @Override
@@ -383,13 +445,7 @@ public class MainApp extends Application {
                 Platform.runLater(() -> goToConnectScene("Connection lost: " + reason));
             }
 
-//            @Override
-//            public void onWaitingPing(){
-//                primaryStage.setTitle("... ждём второго игрока ...");
-//            }
-
-
-            // ----- игровая фаза -----
+            // --- game phase ---
             @Override public void onDeal(String c1, String c2) {
                 Platform.runLater(() -> {
                     createGameView();
@@ -424,9 +480,12 @@ public class MainApp extends Application {
     }
 
     // =================================================================
-    //                           УТИЛИТЫ/ЖИЗНЕННЫЙ ЦИКЛ
+    //                           UTILITIES / LIFECYCLE
     // =================================================================
 
+    /**
+     * Lazily create the {@link GameView} if it has not been created yet.
+     */
     private void createGameView(){
         if (gameView != null) return;
         int ln = lastLobbySelected > 0 ? lastLobbySelected : 0;
@@ -438,6 +497,9 @@ public class MainApp extends Application {
         primaryStage.setScene(gameView.scene());
     }
 
+    /**
+     * Send a "back to lobby" request and switch the UI into the waiting state.
+     */
     private void requestBackToLobby() {
         Platform.runLater(() -> {
             primaryStage.setTitle("Blackjack Client — Lobby");
@@ -454,6 +516,11 @@ public class MainApp extends Application {
         }, "send-back-thread").start();
     }
 
+    /**
+     * Navigate back to the connect scene and close the current client connection.
+     *
+     * @param message Status message to show on the connect scene.
+     */
     private void goToConnectScene(String message) {
         closeClient();
         Platform.runLater(() -> {
@@ -462,6 +529,12 @@ public class MainApp extends Application {
         });
     }
 
+    /**
+     * Convert low-level network exceptions into user-friendly messages.
+     *
+     * @param ex Exception instance.
+     * @return Normalized message string.
+     */
     private String normalizeNetError(Exception ex) {
         String s = ex.getMessage();
         if (s == null || s.isBlank()) s = ex.getClass().getSimpleName();
@@ -469,26 +542,43 @@ public class MainApp extends Application {
         return s;
     }
 
+    /**
+     * Close the current {@link NetClient} (best effort) and clear UI state that depends on it.
+     */
     private void closeClient() {
         try { if (client != null) client.closeQuietly(); } catch (Exception ignored) {}
         client = null;
         gameView = null;
     }
 
+    /**
+     * Reset session state (nickname and last lobby selection).
+     */
     private void resetSession() {
         name = null;
         lastLobbySelected = -1;
     }
 
+    /**
+     * @return true if the session has enough state to attempt manual reconnect.
+     */
     private boolean canManualReconnect() {
         return name != null && !name.isBlank() && lastLobbySelected > 0;
     }
 
+    /**
+     * JavaFX lifecycle callback: called on application shutdown.
+     */
     @Override
     public void stop() {
         closeClient();
     }
 
+    /**
+     * Main entry point for launching the JavaFX application.
+     *
+     * @param args CLI args.
+     */
     public static void main(String[] args) {
         Application.launch(MainApp.class, args);
     }

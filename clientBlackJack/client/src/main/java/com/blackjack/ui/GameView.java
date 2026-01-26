@@ -9,6 +9,23 @@ import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.layout.*;
 
+/**
+ * GameView
+ *
+ * Purpose:
+ *   Simple JavaFX view for an in-lobby Blackjack match.
+ *
+ * Responsibilities:
+ *   - Render current hand and log of events.
+ *   - Enable/disable HIT/STAND based on turn ownership.
+ *   - Provide a "Back to Lobby" action when the game ends.
+ *
+ * Table of contents:
+ *   - Lifecycle: GameView(), scene(), bindClient()
+ *   - Protocol callbacks: onDeal(), onTurn(), onCard(), onBust(), onResult()
+ *   - UI helpers: setTurnEnabled(), setBackEnabled(), append()
+ *   - Hand helpers: addCardToHand(), updateScore(), handValue()
+ */
 public class GameView {
     private final VBox root = new VBox(10);
     private final Label header = new Label();
@@ -22,6 +39,11 @@ public class GameView {
     private String myName;
     private final List<String> hand = new ArrayList<>();
 
+    /**
+     * Create a game view for a given lobby number.
+     *
+     * @param lobbyNum 1-based lobby number (used only for the header text).
+     */
     public GameView(int lobbyNum) {
         header.setStyle("-fx-font-size:18px;-fx-font-weight:bold;");
         header.setText("Lobby #" + lobbyNum + " — Game");
@@ -39,11 +61,38 @@ public class GameView {
         setBackEnabled(false);
     }
 
+    /**
+     * @return A new JavaFX scene containing this view.
+     */
     public Scene scene() { return new Scene(root, 640, 420); }
+
+    /**
+     * Bind the view to a {@link NetClient} used to send game commands.
+     *
+     * @param c NetClient instance.
+     */
     public void bindClient(NetClient c) { this.client = c; }
+
+    /**
+     * Set callback invoked when user clicks "Back to Lobby".
+     *
+     * @param r Runnable callback.
+     */
     public void setOnBackToLobby(Runnable r) { this.onBackToLobby = r; }
+
+    /**
+     * Set the local player name used to decide turn ownership.
+     *
+     * @param name Player name.
+     */
     public void setMyName(String name) { this.myName = name; }
 
+    /**
+     * Handle initial two-card deal.
+     *
+     * @param c1 First card.
+     * @param c2 Second card.
+     */
     public void onDeal(String c1, String c2){
         setBackEnabled(false);
         hand.clear();
@@ -52,15 +101,35 @@ public class GameView {
         updateScore();
         append("Your cards: " + formatCard(c1) + " " + formatCard(c2));
     }
+
+    /**
+     * Handle turn notification.
+     *
+     * @param who Player name whose turn it is.
+     * @param sec Turn timeout in seconds.
+     */
     public void onTurn(String who, int sec){
         append("Move: " + who + " (" + sec + "s)");
         setTurnEnabled(myName != null && myName.equals(who));
     }
+
+    /**
+     * Handle a newly received card for the local player.
+     *
+     * @param c Card string.
+     */
     public void onCard(String c){
         addCardToHand(c);
         updateScore();
         append("You take: " + formatCard(c));
     }
+
+    /**
+     * Handle a bust notification.
+     *
+     * @param p Player name.
+     * @param v Hand value.
+     */
     public void onBust(String p, int v){
         boolean isMe = myName != null && myName.equals(p);
         if (isMe) {
@@ -69,15 +138,44 @@ public class GameView {
         }
         setTurnEnabled(false);
     }
+
+    /**
+     * Handle match result notification.
+     *
+     * @param s Summary string.
+     */
     public void onResult(String s){ System.out.println(s); append("Result: " + s); setTurnEnabled(false); setBackEnabled(true); }
 
+    /**
+     * Enable or disable the HIT/STAND buttons.
+     *
+     * @param b true to enable; false to disable.
+     */
     private void setTurnEnabled(boolean b){ hit.setDisable(!b); stand.setDisable(!b); }
+
+    /**
+     * Show or hide the "Back to Lobby" button.
+     *
+     * @param b true to show; false to hide.
+     */
     private void setBackEnabled(boolean b){
         backToLobby.setDisable(!b);
         backToLobby.setVisible(b);
         backToLobby.setManaged(b);
     }
+
+    /**
+     * Append one line to the log.
+     *
+     * @param s Text to append.
+     */
     private void append(String s){ log.appendText((log.getText().isEmpty()?"":"\n") + s); }
+
+    /**
+     * Send a command asynchronously to avoid blocking the JavaFX UI thread.
+     *
+     * @param io Operation that performs the send.
+     */
     private void sendAsync(IO io){
         Thread t = new Thread(() -> {
             try {
@@ -89,8 +187,17 @@ public class GameView {
         t.setDaemon(true);
         t.start();
     }
+
+    /**
+     * Functional interface for a send operation that may throw.
+     */
     private interface IO { void run() throws Exception; }
 
+    /**
+     * Add a card to the local hand list after basic validation/trim.
+     *
+     * @param card Card string.
+     */
     private void addCardToHand(String card) {
         if (card == null) return;
         String c = card.trim();
@@ -98,6 +205,12 @@ public class GameView {
         hand.add(c);
     }
 
+    /**
+     * Format a compact card string (e.g. "AS") into a user-friendly string.
+     *
+     * @param card Raw card string.
+     * @return Formatted card string.
+     */
     private static String formatCard(String card) {
         if (card == null) return "";
         String c = card.trim();
@@ -116,10 +229,19 @@ public class GameView {
         return String.valueOf(rank) + symbol;
     }
 
+    /**
+     * Update the score label based on current hand.
+     */
     private void updateScore() {
         scoreLabel.setText("Total score: " + handValue(hand));
     }
 
+    /**
+     * Compute Blackjack hand value from compact card strings.
+     *
+     * @param cards Card strings (e.g. "AS", "TD").
+     * @return Hand value.
+     */
     private static int handValue(List<String> cards) {
         int sum = 0;
         int aces = 0;

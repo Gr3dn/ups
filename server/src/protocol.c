@@ -1,3 +1,21 @@
+/*
+ * protocol.c
+ *
+ * Purpose:
+ *   Implementation of low-level line I/O and protocol helpers used by the server:
+ *   - Safe "write all" for TCP sockets.
+ *   - Line-oriented reads (blocking and timed).
+ *   - C45 framed-message helpers.
+ *   - Lobby snapshot serialization.
+ *
+ * Table of contents:
+ *   - write_all()
+ *   - read_line(), read_line_timeout()
+ *   - is_c45_prefix()
+ *   - send_lobbies_snapshot()
+ *   - C45 framing: c45_parse_line(), c45_build_frame(), send_c45(), read_c45()
+ */
+
 #include "protocol.h"
 #include "game.h"
 
@@ -12,6 +30,14 @@
 #define MSG_NOSIGNAL 0
 #endif
 
+/**
+ * Write an entire NUL-terminated string to a socket.
+ *
+ * @param fd Connected socket file descriptor.
+ * @param s  NUL-terminated string to send.
+ *
+ * @return 0 on success; -1 on error.
+ */
 int write_all(int fd, const char* s) {
     size_t n = strlen(s);
     size_t off = 0;
@@ -26,6 +52,17 @@ int write_all(int fd, const char* s) {
     return 0;
 }
 
+/**
+ * Read a single line from a socket into a buffer (byte-by-byte).
+ *
+ * @param fd      Connected socket file descriptor.
+ * @param buf     Destination buffer.
+ * @param buf_sz  Size of @p buf in bytes.
+ *
+ * @return >=0 Length of data stored in @p buf (including '\n' if present).
+ * @return  0  Peer closed the connection.
+ * @return -1  Error.
+ */
 int read_line(int fd, char* buf, size_t buf_sz) {
     if (buf_sz == 0) return -1;
     size_t pos = 0;
@@ -47,10 +84,22 @@ int read_line(int fd, char* buf, size_t buf_sz) {
     return (int)pos;
 }
 
+/**
+ * Check whether the string starts with "C45".
+ *
+ * @param s NUL-terminated string.
+ * @return 1 if prefix matches; 0 otherwise.
+ */
 int is_c45_prefix(const char* s) {
     return s && strncmp(s, "C45", 3) == 0;
 }
 
+/**
+ * Send the lobby list snapshot to a client.
+ *
+ * @param fd Connected socket file descriptor.
+ * @return 0 on success; -1 on error.
+ */
 int send_lobbies_snapshot(int fd) {
     char line[128];
     sleep(2);
@@ -72,10 +121,23 @@ int send_lobbies_snapshot(int fd) {
     }
     if (write_all(fd, "C45END\n") < 0) return -1;
 
-    printf("[PROTO] -> Send snapsho of lobby to client (fd=%d)\n", fd);
+    printf("[PROTO] -> Send lobby snapshot to client (fd=%d)\n", fd);
     return 0;
 }
 
+/**
+ * Read a single line with a poll()-based timeout.
+ *
+ * @param fd            Connected socket file descriptor.
+ * @param buf           Destination buffer.
+ * @param sz            Size of @p buf in bytes.
+ * @param timeout_sec   Timeout in seconds for the first read attempt.
+ *
+ * @return >=0 Length of data stored in @p buf (including '\n' if present).
+ * @return  0  Peer closed the connection.
+ * @return -2  Timeout expired.
+ * @return -1  Error.
+ */
 int read_line_timeout(int fd, char* buf, size_t sz, int t) {
     size_t pos = 0;
     while (pos < sz - 1) {
@@ -94,6 +156,18 @@ int read_line_timeout(int fd, char* buf, size_t sz, int t) {
     return (int)pos;
 }
 
+/**
+ * Parse a C45 framed line into a payload buffer.
+ *
+ * @param line   NUL-terminated input line.
+ * @param out    Destination payload buffer.
+ * @param out_sz Size of @p out in bytes.
+ *
+ * @return  1  Parsed successfully.
+ * @return  0  Not a C45 frame.
+ * @return -2  Invalid length digits or length mismatch.
+ * @return -3  Output buffer too small.
+ */
 int c45_parse_line(const char* line, char* out, size_t out_sz) {
     if (!line) return 0;
     if (strncmp(line, "C45", 3) != 0) return 0;
@@ -115,6 +189,15 @@ int c45_parse_line(const char* line, char* out, size_t out_sz) {
     return 1;
 }
 
+/**
+ * Build a C45 framed line from a payload.
+ *
+ * @param payload NUL-terminated payload string (NULL treated as empty string).
+ * @param out     Destination buffer for the resulting frame.
+ * @param out_sz  Size of @p out in bytes.
+ *
+ * @return 0 on success; -1 on error.
+ */
 int c45_build_frame(const char* payload, char* out, size_t out_sz) {
     if (!payload) payload = "";
     int len = (int)strlen(payload);
@@ -126,12 +209,33 @@ int c45_build_frame(const char* payload, char* out, size_t out_sz) {
     return 0;
 }
 
+/**
+ * Send a payload as a C45 framed line.
+ *
+ * @param fd      Connected socket file descriptor.
+ * @param payload Payload string.
+ *
+ * @return 0 on success; -1 on error.
+ */
 int send_c45(int fd, const char* payload) {
     char buf[3 + 2 + C45_MAX_PAYLOAD + 2]; // "C45" + len + payload + "\n\0"
     if (c45_build_frame(payload, buf, sizeof(buf)) != 0) return -1;
     return write_all(fd, buf) < 0 ? -1 : 0;
 }
 
+/**
+ * Read a line from a socket and decode it as a C45 frame.
+ *
+ * @param fd          Connected socket file descriptor.
+ * @param out_payload Destination buffer for payload.
+ * @param out_sz      Size of @p out_payload in bytes.
+ *
+ * @return >0   Payload length.
+ * @return  0   EOF (peer closed).
+ * @return -100 Not a C45 frame.
+ * @return -101 Length error.
+ * @return -1   Other I/O error.
+ */
 int read_c45(int fd, char* out_payload, size_t out_sz) {
     char line[READ_BUF];
     int r = read_line(fd, line, sizeof(line));
