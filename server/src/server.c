@@ -28,6 +28,8 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -41,6 +43,7 @@
 #include <unistd.h>
 
 #define ACTIVE_MAX 256
+#define CLIENT_FD_MAX 1024
 #define WAITING_INTERVAL_SEC 5
 // Reserving names among all active connections (until disconnect)
 static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
@@ -50,6 +53,143 @@ static int  g_active_back_req[ACTIVE_MAX];
 static unsigned long long g_active_tokens[ACTIVE_MAX];
 static unsigned long long g_token_seq = 1;
 static int  g_active_cnt = 0;
+
+// Connected client sockets (including those who haven't completed handshake yet).
+static pthread_mutex_t g_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int  g_client_fds[CLIENT_FD_MAX];
+static int  g_client_cnt = 0;
+
+/**
+ * Register a connected client socket file descriptor.
+ *
+ * This registry is used to broadcast server shutdown notifications and to
+ * force-disconnect all clients promptly (including those still in handshake).
+ *
+ * @param fd Connected socket file descriptor.
+ */
+static void client_fd_add(int fd) {
+    pthread_mutex_lock(&g_clients_mtx);
+    if (g_client_cnt < CLIENT_FD_MAX) {
+        // Prevent duplicates (should not happen, but keeps the registry robust).
+        for (int i = 0; i < g_client_cnt; ++i) {
+            if (g_client_fds[i] == fd) {
+                pthread_mutex_unlock(&g_clients_mtx);
+                return;
+            }
+        }
+        g_client_fds[g_client_cnt++] = fd;
+    }
+    pthread_mutex_unlock(&g_clients_mtx);
+}
+
+/**
+ * Unregister a client socket file descriptor.
+ *
+ * @param fd Socket file descriptor to remove.
+ */
+static void client_fd_remove(int fd) {
+    pthread_mutex_lock(&g_clients_mtx);
+    for (int i = 0; i < g_client_cnt; ++i) {
+        if (g_client_fds[i] == fd) {
+            g_client_fds[i] = g_client_fds[g_client_cnt - 1];
+            g_client_cnt--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_clients_mtx);
+}
+
+/**
+ * Best-effort notify all connected clients about server shutdown and disconnect them.
+ *
+ * This is used when the server is stopping (SIGINT) or when it detects that its
+ * bind address is no longer available (network/interface changes).
+ *
+ * The notification is best-effort: if a socket can't be written to, we still
+ * shutdown() it to unblock per-client threads quickly.
+ *
+ * @param reason Optional single-token reason (e.g. "SIGINT", "NETWORK_LOST").
+ */
+static void server_notify_and_disconnect_all(const char* reason) {
+    int fds[CLIENT_FD_MAX];
+    int cnt = 0;
+
+    pthread_mutex_lock(&g_clients_mtx);
+    cnt = g_client_cnt;
+    if (cnt > CLIENT_FD_MAX) cnt = CLIENT_FD_MAX;
+    for (int i = 0; i < cnt; ++i) fds[i] = g_client_fds[i];
+    pthread_mutex_unlock(&g_clients_mtx);
+
+    char msg[128];
+    if (reason && *reason) snprintf(msg, sizeof(msg), "C45SERVER_DOWN %s\n", reason);
+    else snprintf(msg, sizeof(msg), "C45SERVER_DOWN\n");
+    size_t len = strlen(msg);
+
+    for (int i = 0; i < cnt; ++i) {
+        int fd = fds[i];
+        (void)send(fd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+        (void)shutdown(fd, SHUT_RDWR);
+    }
+}
+
+/**
+ * Check whether the server bind IPv4 address is still present on any interface.
+ *
+ * This helps detect cases where the server process keeps running but becomes
+ * unreachable because the configured bind address disappeared (e.g. Wi‑Fi off,
+ * VPN/WSL IP change).
+ *
+ * For "localhost" this check is skipped.
+ *
+ * For "0.0.0.0" (INADDR_ANY) we consider "network is gone" to be "no non-loopback IPv4
+ * interface is UP". Use "localhost" for a local-only server.
+ *
+ * @param bind_ip Bind address passed to run_server().
+ * @return 1 if the bind IP is available (or check is skipped); 0 if missing.
+ */
+static int is_bind_ip_available(const char* bind_ip) {
+    struct ifaddrs* ifaddr = NULL;
+
+    // INADDR_ANY: treat "network is gone" as "no non-loopback IPv4 interface is UP".
+    // If you want a local-only server that doesn't depend on external network state, bind to "localhost".
+    if (!bind_ip || strcmp(bind_ip, "0.0.0.0") == 0) {
+        if (getifaddrs(&ifaddr) != 0) return 1; // best-effort: assume OK if we can't query
+        int ok = 0;
+        for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) continue;
+            if (ifa->ifa_addr->sa_family != AF_INET) continue;
+            if (!(ifa->ifa_flags & IFF_UP)) continue;
+            if (ifa->ifa_flags & IFF_LOOPBACK) continue;
+            ok = 1;
+            break;
+        }
+        freeifaddrs(ifaddr);
+        return ok;
+    }
+
+    if (strcmp(bind_ip, "localhost") == 0) return 1;
+
+    struct in_addr target;
+    if (inet_pton(AF_INET, bind_ip, &target) != 1) return 1;
+
+    if (getifaddrs(&ifaddr) != 0) return 1; // best-effort: assume OK if we can't query
+
+    int found = 0;
+    for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP)) continue;
+
+        struct sockaddr_in* sa = (struct sockaddr_in*)ifa->ifa_addr;
+        if (sa->sin_addr.s_addr == target.s_addr) {
+            found = 1;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found;
+}
 
 /**
  * Check whether a received line matches a protocol token exactly.
@@ -416,6 +556,8 @@ static void* client_thread(void* arg) {
     int cfd = (int)(intptr_t)arg;
     printf("[NET] Client start (fd=%d)\n", cfd);
 
+    client_fd_add(cfd);
+
     /* timeouts */
     struct timeval tv; tv.tv_sec = 120; tv.tv_usec = 0;
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -432,12 +574,14 @@ static void* client_thread(void* arg) {
         n = read_line(cfd, line, sizeof(line));
         if (n <= 0) {
             printf("[NET] Client fd=%d closed during handshake\n", cfd);
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
         if (!is_c45_prefix(line)) {
             printf("[PROTO] Wrong handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
             write_all(cfd, "C45WRONG\n");
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
@@ -458,6 +602,7 @@ static void* client_thread(void* arg) {
         if (sscanf(line, "C45RECONNECT %63s %d", name, &lobby_num) != 2 ||
             lobby_num < 1 || lobby_num > g_lobby_count) {
             write_all(cfd, "C45WRONG RECONNECT\n");
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
@@ -468,6 +613,7 @@ static void* client_thread(void* arg) {
                 if (active_name_add(name) != 0) {
                     pthread_mutex_unlock(&g_names_mtx);
                     write_all(cfd, "C45WRONG RECONNECT\n");
+                    client_fd_remove(cfd);
                     close(cfd);
                     return NULL;
                 }
@@ -484,6 +630,7 @@ static void* client_thread(void* arg) {
         // and immediately send the lobby snapshot instead of disconnecting the client.
         if (lobby_name_exists(name)) {
             write_all(cfd, "C45WRONG NAME_TAKEN\n");
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
@@ -493,6 +640,7 @@ static void* client_thread(void* arg) {
             if (active_name_add(name) != 0) {
                 pthread_mutex_unlock(&g_names_mtx);
                 write_all(cfd, "C45WRONG\n");
+                client_fd_remove(cfd);
                 close(cfd);
                 return NULL;
             }
@@ -504,6 +652,7 @@ static void* client_thread(void* arg) {
             pthread_mutex_lock(&g_names_mtx);
             active_name_remove_if_token(name, my_token);
             pthread_mutex_unlock(&g_names_mtx);
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
@@ -512,6 +661,7 @@ static void* client_thread(void* arg) {
             pthread_mutex_lock(&g_names_mtx);
             active_name_remove_if_token(name, my_token);
             pthread_mutex_unlock(&g_names_mtx);
+            client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
@@ -523,6 +673,7 @@ static void* client_thread(void* arg) {
     if (parse_name_only(line, name, sizeof(name)) != 0) {
         printf("[PROTO] Bad name in handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
         write_all(cfd, "C45WRONG\n");
+        client_fd_remove(cfd);
         close(cfd);
         return NULL;
     }
@@ -530,6 +681,7 @@ static void* client_thread(void* arg) {
 
     if (lobby_name_exists(name)) {
         write_all(cfd, "C45WRONG NAME_TAKEN\n");
+        client_fd_remove(cfd);
         close(cfd);
         return NULL;
     }
@@ -544,6 +696,7 @@ static void* client_thread(void* arg) {
     pthread_mutex_unlock(&g_names_mtx);
     if (taken) {
         write_all(cfd, "C45WRONG NAME_TAKEN\n");
+        client_fd_remove(cfd);
         close(cfd);
         return NULL;
     }
@@ -553,6 +706,7 @@ static void* client_thread(void* arg) {
         pthread_mutex_lock(&g_names_mtx);
         active_name_remove_if_token(name, my_token);
         pthread_mutex_unlock(&g_names_mtx);
+        client_fd_remove(cfd);
         close(cfd);
         return NULL;
     }
@@ -563,6 +717,7 @@ static void* client_thread(void* arg) {
         pthread_mutex_lock(&g_names_mtx);
         active_name_remove_if_token(name, my_token);
         pthread_mutex_unlock(&g_names_mtx);
+        client_fd_remove(cfd);
         close(cfd);
         return NULL;
     }
@@ -754,6 +909,7 @@ disconnect:
     pthread_mutex_lock(&g_names_mtx);
     active_name_remove_if_token(name, my_token);
     pthread_mutex_unlock(&g_names_mtx);
+    client_fd_remove(cfd);
     close(cfd);
     return NULL;
 }
@@ -769,6 +925,7 @@ disconnect:
  */
 int run_server(const char* bind_ip, int port) {
     signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
     signal(SIGPIPE, SIG_IGN);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -802,14 +959,51 @@ int run_server(const char* bind_ip, int port) {
         perror("listen"); close(srv); return 1;
     }
 
+    int ret = 0;
+    const char* stop_reason = NULL;
+    time_t last_ip_check = 0;
+
     printf("Server listening on %s:%d\n", bind_ip, port);
     while (g_server_running) {
+        time_t now = time(NULL);
+        if (now - last_ip_check >= 2) {
+            last_ip_check = now;
+            if (!is_bind_ip_available(bind_ip)) {
+                fprintf(stderr,
+                        "[NET] Bind IP %s is no longer available; stopping the server.\n",
+                        bind_ip);
+                stop_reason = "NETWORK_LOST";
+                g_server_running = 0;
+                break;
+            }
+        }
+
+        struct pollfd spfd = { .fd = srv, .events = POLLIN | POLLERR | POLLHUP };
+        int spr = poll(&spfd, 1, 1000);
+        if (spr == 0) continue;
+        if (spr < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            ret = 1;
+            stop_reason = "LISTEN_ERROR";
+            break;
+        }
+        if (spfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "[NET] Listen socket error (revents=%d)\n", spfd.revents);
+            ret = 1;
+            stop_reason = "LISTEN_ERROR";
+            break;
+        }
+        if (!(spfd.revents & POLLIN)) continue;
+
         struct sockaddr_in cli;
         socklen_t clen = sizeof(cli);
         int cfd = accept(srv, (struct sockaddr*)&cli, &clen);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             perror("accept");
+            ret = 1;
+            stop_reason = "ACCEPT_ERROR";
             break;
         }
 
@@ -821,7 +1015,9 @@ int run_server(const char* bind_ip, int port) {
         pthread_detach(th);
     }
 
+    if (!stop_reason) stop_reason = "SIGINT";
+    server_notify_and_disconnect_all(stop_reason);
     close(srv);
     printf("Server stopped\n");
-    return 0;
+    return ret;
 }

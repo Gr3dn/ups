@@ -127,6 +127,15 @@ public class NetClient {
                         try { sendPong(); } catch (IOException ignored) {}
                         continue;
                     }
+                    if (t.startsWith("C45SERVER_DOWN")) {
+                        String reason = t.substring("C45SERVER_DOWN".length()).trim();
+                        String msg = reason.isEmpty()
+                                ? "Server shut down"
+                                : "Server shut down: " + reason;
+                        l.onServerError(msg);
+                        closeQuietly();
+                        return;
+                    }
                     if (t.startsWith("C45RECONNECT_OK")) {
                         // We are back on the server. It can either resume the game (hand snapshot)
                         // or (if the game already ended) send a normal lobby snapshot.

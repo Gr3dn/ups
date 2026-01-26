@@ -31,3 +31,4 @@ All messages are sent over TCP as text lines and must end with `\n`.
 ## Basic server responses
 - `C45OK\n` — everything is ok
 - `C45WRONG...\n` — protocol error / invalid request
+- `C45SERVER_DOWN [reason]\n` — server is shutting down; client should disconnect
