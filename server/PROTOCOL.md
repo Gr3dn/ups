@@ -19,6 +19,7 @@ All messages are sent over TCP as text lines and must end with `\n`.
 ## Keepalive (both directions)
 - `C45PING\n`
 - `C45PONG\n` — answer for `C45PING`
+> Note: keepalive can be used at any time (including before the nickname/handshake is sent).
 
 ## Basic server responses
 - `C45OK\n` — everything is ok

@@ -11,10 +11,15 @@ public class NetClient {
     private final int port;
     private final int connectTimeoutMs;
 
+    // Client-side timeouts are what make the UI react quickly when the server process/machine disappears.
+    // Keep HEARTBEAT_INTERVAL_MS <= SERVER_SILENCE_TIMEOUT_MS to avoid false "server not responding"
+    // while the connection is simply idle.
     private static final int SOCKET_READ_TIMEOUT_MS = 1000;
-    private static final int HEARTBEAT_INTERVAL_MS = 5000;
-    private static final int SERVER_SILENCE_TIMEOUT_MS = 15000;
-    private static final int HANDSHAKE_TIMEOUT_MS = 10000;
+    private static final int HEARTBEAT_INTERVAL_MS = 2000;
+    private static final int SERVER_SILENCE_TIMEOUT_MS = 4000;
+    private static final int HANDSHAKE_TIMEOUT_MS = 4000;
+    private static final int RECONNECT_WINDOW_MS = 5000;
+    private static final int RECONNECT_CONNECT_TIMEOUT_MS = 1000;
 
     private Socket socket;
     private OutputStream os;
@@ -56,14 +61,18 @@ public class NetClient {
         return new NetClient(s, host, port, timeoutMs);
     }
 
-    public void startReader(ProtocolListener l) {
+    public synchronized void startReader(ProtocolListener l) {
+        if (reader != null && reader.isAlive()) return;
         reader = new Thread(() -> {
             lastServerMessageMs = System.currentTimeMillis();
             lastPingMs = 0L;
             while (!closing) {
                 try {
                     String line = br.readLine();
-                    if (line == null) throw new EOFException("server closed");
+                    System.out.println(line);
+                    if (line == null){
+                        throw new EOFException("server closed");
+                        }
                     String t = line.trim();
                     lastServerMessageMs = System.currentTimeMillis();
                     System.out.println(t);
@@ -236,10 +245,9 @@ public class NetClient {
                 } catch (SocketTimeoutException ste) {
                     if (closing) return;
                     long now = System.currentTimeMillis();
-
                     if (!handshakeDone && handshakeSentMs > 0 &&
                             now - handshakeSentMs > HANDSHAKE_TIMEOUT_MS) {
-                        if (tryReconnect()) continue;
+                        if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
                         l.onServerError("Server handshake timeout");
                         closeQuietly();
                         return;
@@ -251,7 +259,19 @@ public class NetClient {
                             lastPingMs = now;
                         }
                         if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
-                            if (tryReconnect()) continue;
+                            if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
+                            l.onServerError("Server is not responding");
+                            closeQuietly();
+                            return;
+                        }
+                    } else if (handshakeSentMs == 0) {
+                        // Connected, but the user didn't send a name yet. Keep the connection alive and
+                        // detect a dead server quickly by using PING/PONG even before the handshake.
+                        if (now - lastPingMs >= HEARTBEAT_INTERVAL_MS) {
+                            try { sendPing(); } catch (IOException ignored) {}
+                            lastPingMs = now;
+                        }
+                        if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
                             l.onServerError("Server is not responding");
                             closeQuietly();
                             return;
@@ -265,11 +285,9 @@ public class NetClient {
                     return;
                 } catch (Exception ex) {
                     if (closing) return;
-                    if (tryReconnect()) continue;
-                    System.out.println(ex);
-                    System.out.println("Trying read Bad line");
+                    if (tryReconnect(RECONNECT_WINDOW_MS)) continue;
                     if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
-                        l.onServerError("Unable to restore connection within 30 seconds. Please reconnect manually.");
+                        l.onServerError("Unable to restore connection within " + (RECONNECT_WINDOW_MS / 1000) + " seconds. Please reconnect manually.");
                     } else {
                         l.onServerError(ex.getMessage());
                     }
@@ -312,6 +330,17 @@ public class NetClient {
         sendRaw("C45" + (name == null ? "" : name) + "back\n");
     }
 
+    public void sendReconnect(String name, int lobby) throws IOException {
+        if (name == null) name = "";
+        lastName = name;
+        lastLobby = lobby;
+        handshakeDone = false;
+        handshakeSentMs = System.currentTimeMillis();
+        state = State.WAIT_OK;
+        expectLobbySnapshot = true;
+        sendRaw("C45RECONNECT " + name + " " + lobby + "\n");
+    }
+
 //    public void sendName(String name) throws IOException { sendRaw(buildC45Frame(name)); }
 //    // "C45<name><lobby>" как и было — но в payload
 //    public void sendJoin(String name, int lobby) throws IOException { sendRaw(buildC45Frame(name + lobby)); }
@@ -338,7 +367,7 @@ public class NetClient {
         lastPingMs = 0L;
     }
 
-    private boolean tryReconnect() {
+    private boolean tryReconnect(long windowMs) {
         String n = lastName;
         int lobby = lastLobby;
         if (n == null || n.isBlank()) return false;
@@ -348,11 +377,11 @@ public class NetClient {
         expectLobbySnapshot = true;
         handshakeDone = false;
 
-        long deadline = System.currentTimeMillis() + 30000L;
+        long deadline = System.currentTimeMillis() + Math.max(0L, windowMs);
         while (!closing && System.currentTimeMillis() < deadline) {
             try {
                 Socket s = new Socket();
-                int to = Math.min(connectTimeoutMs, 3000);
+                int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
                 s.connect(new InetSocketAddress(host, port), to);
                 replaceConnection(s);
                 handshakeSentMs = System.currentTimeMillis();
@@ -363,7 +392,7 @@ public class NetClient {
                 }
                 return true;
             } catch (Exception ignored) {
-                try { Thread.sleep(500); } catch (InterruptedException ie) { break; }
+                try { Thread.sleep(250); } catch (InterruptedException ie) { break; }
             }
         }
 

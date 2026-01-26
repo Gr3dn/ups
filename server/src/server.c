@@ -29,6 +29,14 @@ static unsigned long long g_active_tokens[ACTIVE_MAX];
 static unsigned long long g_token_seq = 1;
 static int  g_active_cnt = 0;
 
+static int is_token(const char* line, const char* tok) {
+    if (!line || !tok) return 0;
+    size_t n = strlen(tok);
+    if (strncmp(line, tok, n) != 0) return 0;
+    char c = line[n];
+    return (c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t');
+}
+
 /* --- Help --- */
 static void on_sigint(int sig) {
     (void)sig;
@@ -323,12 +331,30 @@ static void* client_thread(void* arg) {
     unsigned long long my_token = 0;
 
     /* --- Handshake --- */
-    int n = read_line(cfd, line, sizeof(line));
-    if (n <= 0 || !is_c45_prefix(line)) {
-        printf("[PROTO] Wrong handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
-        write_all(cfd, "C45WRONG\n");
-        close(cfd);
-        return NULL;
+    int n;
+    for (;;) {
+        n = read_line(cfd, line, sizeof(line));
+        if (n <= 0) {
+            printf("[NET] Client fd=%d closed during handshake\n", cfd);
+            close(cfd);
+            return NULL;
+        }
+        if (!is_c45_prefix(line)) {
+            printf("[PROTO] Wrong handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
+            write_all(cfd, "C45WRONG\n");
+            close(cfd);
+            return NULL;
+        }
+
+        // Allow keep-alive before a name is entered (client may keep the TCP connection open
+        // while waiting on the "enter nickname" screen).
+        if (is_token(line, "C45PING")) {
+            (void)write_all(cfd, "C45PONG\n");
+            continue;
+        }
+        if (is_token(line, "C45PONG")) continue;
+
+        break; // real handshake line
     }
 
     // Reconnect path: first line is "C45RECONNECT <name> <lobby>\n"
@@ -455,15 +481,15 @@ lobby_select:
                 printf("[NET] Client fd=%d closed before lobby choise\n", cfd);
                 goto disconnect;
             }
-            printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
+            // printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
 
             // Client keep-alive (bidirectional): reply and continue waiting for real commands.
-            if (strncmp(line, "C45PING", 7) == 0) {
+            if (is_token(line, "C45PING")) {
                 (void)write_all(cfd, "C45PONG\n");
                 continue;
             }
-            if (strncmp(line, "C45PONG", 7) == 0) continue;
-
+            if (is_token(line, "C45PONG")) continue;
+            
             int br = is_back_request_for(line, name);
             if (br == 1) {
                 // Allow requesting the snapshot at any time outside the game loop
@@ -575,11 +601,11 @@ lobby_select:
 		                goto disconnect;
 		            }
 
-		            if (strncmp(line, "C45PING", 7) == 0) {
+		            if (is_token(line, "C45PING")) {
 		                (void)write_all(cfd, "C45PONG\n");
 		                continue;
 		            }
-		            if (strncmp(line, "C45PONG", 7) == 0) continue;
+		            if (is_token(line, "C45PONG")) continue;
 		            if (strncmp(line, "C45YES", 6) == 0) continue;
 
 		            int br = is_back_request_for(line, name);
@@ -609,11 +635,11 @@ game_wait:
 	        for (;;) {
 	            n = read_line(cfd, line, sizeof(line));
 	            if (n <= 0) goto disconnect;
-	            if (strncmp(line, "C45PING", 7) == 0) {
+	            if (is_token(line, "C45PING")) {
 	                (void)write_all(cfd, "C45PONG\n");
 	                continue;
 	            }
-	            if (strncmp(line, "C45PONG", 7) == 0) continue;
+	            if (is_token(line, "C45PONG")) continue;
 	            if (strncmp(line, "C45YES", 6) == 0) continue;
 	            int br = is_back_request_for(line, name);
 	            if (br == 1) break;

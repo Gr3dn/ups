@@ -28,6 +28,8 @@ public class MainApp extends Application {
     private NetClient client;
     private String name;
     private int lastLobbySelected = -1;
+    private String lastHost;
+    private int lastPort;
 
     // -------- UI --------
     private Stage primaryStage;
@@ -73,7 +75,13 @@ public class MainApp extends Application {
         portField.setPromptText("Server port (for example: 10000)");
 
         Button connectBtn = new Button("Connect");
+        Button reconnectBtn = new Button("Reconnect");
         Label status = new Label(msg == null ? "" : msg);
+
+        if (lastHost != null && !lastHost.isBlank()) ipField.setText(lastHost);
+        if (lastPort > 0) portField.setText(Integer.toString(lastPort));
+
+        reconnectBtn.setDisable(!canManualReconnect());
 
         connectBtn.setOnAction(e -> {
             String ip = ipField.getText().trim();
@@ -89,13 +97,17 @@ public class MainApp extends Application {
                 return;
             }
 
+            lastHost = ip;
+            lastPort = port;
+
             connectBtn.setDisable(true);
             status.setText("Connection...");
 
             new Thread(() -> {
                 try {
                     closeClient();
-                    client = NetClient.connect(ip, port, 30000);
+                    client = NetClient.connect(ip, port, 5000);
+                    client.startReader(buildListener());
                     Platform.runLater(() -> {
                         primaryStage.setTitle("Blackjack Client — enter name");
                         primaryStage.setScene(buildNameScene());
@@ -109,6 +121,54 @@ public class MainApp extends Application {
             }, "connect-thread").start();
         });
 
+        reconnectBtn.setOnAction(e -> {
+            if (!canManualReconnect()) {
+                status.setText("Nothing to reconnect: join a lobby first.");
+                return;
+            }
+
+            String ip = ipField.getText().trim();
+            String portText = portField.getText().trim();
+            if (ip.isEmpty() || portText.isEmpty()) { status.setText("Enter IP and Port."); return; }
+
+            int port;
+            try {
+                port = Integer.parseInt(portText);
+                if (port < 1 || port > 65535) throw new NumberFormatException();
+            } catch (NumberFormatException ex) {
+                status.setText("Port must be a number 1–65535.");
+                return;
+            }
+
+            lastHost = ip;
+            lastPort = port;
+
+            reconnectBtn.setDisable(true);
+            connectBtn.setDisable(true);
+            status.setText("Reconnecting...");
+
+            new Thread(() -> {
+                try {
+                    closeClient();
+                    client = NetClient.connect(ip, port, 5000);
+                    client.startReader(buildListener());
+                    client.sendReconnect(name, lastLobbySelected);
+                    Platform.runLater(() -> {
+                        primaryStage.setTitle("Blackjack Client — reconnecting");
+                        primaryStage.setScene(buildLobbyWaitingScene("Reconnecting to the server..."));
+                    });
+                } catch (Exception ex2) {
+                    String reason = normalizeNetError(ex2);
+                    goToConnectScene("Connection ERROR: " + reason);
+                } finally {
+                    Platform.runLater(() -> {
+                        reconnectBtn.setDisable(false);
+                        connectBtn.setDisable(false);
+                    });
+                }
+            }, "reconnect-thread").start();
+        });
+
         GridPane root = new GridPane();
         root.setPadding(new Insets(16));
         root.setVgap(10);
@@ -117,7 +177,7 @@ public class MainApp extends Application {
         root.add(ipField, 1, 0);
         root.add(new Label("Port:"), 0, 1);
         root.add(portField, 1, 1);
-        root.add(connectBtn, 1, 2);
+        root.add(new HBox(8, connectBtn, reconnectBtn), 1, 2);
         root.add(status, 1, 3);
         GridPane.setColumnSpan(status, 2);
         root.setAlignment(Pos.CENTER);
@@ -157,7 +217,6 @@ public class MainApp extends Application {
                 try {
                     if (client == null) throw new SocketException("Connection broke");
                     // запускаем ридер С ПОДПИСАННЫМ listener'ом
-                    client.startReader(buildListener());
                     client.sendName(name);
                 } catch (Exception ex) {
                     String reason = normalizeNetError(ex);
@@ -185,7 +244,11 @@ public class MainApp extends Application {
 
     // ---------- Ожидание снимка лобби ----------
     private Scene buildLobbyWaitingScene() {
-        Label lbl = new Label("Confirmed. Waiting for the lobby list from the server...");
+        return buildLobbyWaitingScene("Confirmed. Waiting for the lobby list from the server...");
+    }
+
+    private Scene buildLobbyWaitingScene(String message) {
+        Label lbl = new Label(message == null ? "" : message);
         ProgressIndicator pi = new ProgressIndicator();
         pi.setPrefSize(48, 48);
 
@@ -260,7 +323,7 @@ public class MainApp extends Application {
 
         Button backBtn = new Button("Disconnect");
         backBtn.setOnAction(e -> {
-            closeClient();
+            resetSession();
             goToConnectScene("Connection closed.");
         });
 
@@ -410,7 +473,15 @@ public class MainApp extends Application {
         try { if (client != null) client.closeQuietly(); } catch (Exception ignored) {}
         client = null;
         gameView = null;
+    }
+
+    private void resetSession() {
+        name = null;
         lastLobbySelected = -1;
+    }
+
+    private boolean canManualReconnect() {
+        return name != null && !name.isBlank() && lastLobbySelected > 0;
     }
 
     @Override

@@ -20,6 +20,14 @@ int    g_lobby_count = 5; // default value
 atomic_int g_server_running = 1;
 static void* lobby_game_thread(void* arg);
 
+static int is_token(const char* line, const char* tok) {
+    if (!line || !tok) return 0;
+    size_t n = strlen(tok);
+    if (strncmp(line, tok, n) != 0) return 0;
+    char c = line[n];
+    return (c == '\0' || c == '\n' || c == '\r' || c == ' ' || c == '\t');
+}
+
 // Server network config (definitions)
 char g_server_ip[64] = "0.0.0.0";
 int  g_server_port   = 10000;
@@ -316,12 +324,12 @@ static int drain_nonactive_player_input(Lobby* L,
                 memmove(inbuf, inbuf + line_len, *inlen - line_len);
                 *inlen -= line_len;
 
-                if (strncmp(line, "C45PONG", 7) == 0) continue;
-                if (strncmp(line, "C45PING", 7) == 0) {
+                if (is_token(line, "C45PONG")) continue;
+                if (is_token(line, "C45PING")) {
                     (void)write_all(other_fd, "C45PONG\n");
                     continue;
                 }
-                if (strncmp(line, "C45YES", 6) == 0) continue;
+                if (is_token(line, "C45YES")) continue;
 
                 // Allow quitting the game from the non-active side too.
                 pthread_mutex_lock(&L->mtx);
@@ -411,9 +419,9 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
             // no data
         } else if (r <= 0) {
             return -1;
-        } else if (strncmp(buf, "C45PONG", 7) == 0) {
+        } else if (is_token(buf, "C45PONG")) {
             last_pong = now;
-        } else if (strncmp(buf, "C45PING", 7) == 0) {
+        } else if (is_token(buf, "C45PING")) {
             (void)write_all(other_fd, "C45PONG\n");
             last_pong = now;
         } else if (is_back_request_for_name(buf, other_name) == 1) {
@@ -532,14 +540,14 @@ static void* lobby_game_thread(void* arg) {
 	                // no input this second
 		            } else if (r <= 0) {
 		                goto pause_turn;
-		            } else if (strncmp(buf, "C45PONG", 7) == 0) {
+		            } else if (is_token(buf, "C45PONG")) {
 		                last_pong = now;
 		                continue;
-		            } else if (strncmp(buf, "C45PING", 7) == 0) {
+		            } else if (is_token(buf, "C45PING")) {
 		                (void)write_all(pfd, "C45PONG\n");
 		                last_pong = now;
 		                continue;
-		            } else if (strncmp(buf, "C45YES", 6) == 0) {
+		            } else if (is_token(buf, "C45YES")) {
 		                // Can arrive late from the lobby waiting phase; ignore.
 		                continue;
 		            } else if (is_back_request_for_name(buf, L->players[turn].name) == 1) {
