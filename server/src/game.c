@@ -337,7 +337,7 @@ int start_game_if_ready(int li) {
 }
 
 /**
- * Mark a player as disconnected and close its socket fd (if any).
+ * Mark a player as disconnected and shut down its socket (if any).
  *
  * @param L            Lobby.
  * @param player_index Player slot index within the lobby.
@@ -348,7 +348,11 @@ static void player_disconnect_fd(Lobby* L, int player_index) {
     old_fd = L->players[player_index].fd;
     L->players[player_index].fd = -1;
     pthread_mutex_unlock(&L->mtx);
-    if (old_fd >= 0) close(old_fd);
+    // Do not close() here: the per-client network thread owns the lifetime of the fd.
+    // Closing from the game thread can race with reconnects and fd reuse, causing the
+    // new connection to be closed or consumed by a stale thread. shutdown() is enough
+    // to unblock any pending I/O and mark the connection as dead.
+    if (old_fd >= 0) (void)shutdown(old_fd, SHUT_RDWR);
 }
 
 /**

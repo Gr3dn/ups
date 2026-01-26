@@ -35,8 +35,8 @@ public class NetClient {
     private static final int SERVER_SILENCE_TIMEOUT_MS = 4000;
     private static final int PONG_RESPONSE_TIMEOUT_MS = 3000;
     private static final int HANDSHAKE_TIMEOUT_MS = 4000;
-    private static final int RECONNECT_WINDOW_MS = 10000;
-    private static final int RECONNECT_MAX_ATTEMPTS = 5;
+    private static final int RECONNECT_WINDOW_MS = 16000;
+    private static final int RECONNECT_MAX_ATTEMPTS = 8;
     private static final int RECONNECT_CONNECT_TIMEOUT_MS = 1000;
 
     private Socket socket;
@@ -409,7 +409,10 @@ public class NetClient {
                     return;
                 } catch (Exception ex) {
                     if (closing) return;
-                    if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                    if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) {
+
+                        continue;
+                    }
                     if (lastName != null && !lastName.isBlank() && lastLobby > 0) {
                         l.onServerError(autoReconnectFailedMessage());
                     } else {
@@ -560,6 +563,7 @@ public class NetClient {
             long attemptStart = System.currentTimeMillis();
             try {
                 attempts++;
+                System.out.println("Reccon attempt: " + attempts);
                 Socket s = new Socket();
                 int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
                 long remaining = deadline - System.currentTimeMillis();
