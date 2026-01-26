@@ -389,6 +389,84 @@ static int lobby_try_reconnect(int lobby_index, const char* name, int fd) {
 }
 
 /**
+ * Try to take over a lobby slot while the lobby is not running (waiting phase).
+ *
+ * This allows a client to reconnect after losing TCP connection while waiting for
+ * an opponent. The reconnect overwrites the stored fd for the matching player.
+ *
+ * @param lobby_index Zero-based lobby index.
+ * @param name        Player name.
+ * @param fd          New connected socket file descriptor.
+ * @param out_old_fd  Optional output: previous fd value (or -1).
+ * @return 0 on success; -1 on failure.
+ */
+static int lobby_try_takeover_waiting(int lobby_index,
+                                      const char* name,
+                                      int fd,
+                                      int* out_old_fd) {
+    if (lobby_index < 0 || lobby_index >= g_lobby_count) return -1;
+    if (!name || !*name) return -1;
+
+    Lobby* L = &g_lobbies[lobby_index];
+    pthread_mutex_lock(&L->mtx);
+
+    if (L->is_running) {
+        pthread_mutex_unlock(&L->mtx);
+        return -1;
+    }
+
+    for (int p = 0; p < LOBBY_SIZE; ++p) {
+        Player* pl = &L->players[p];
+        if (pl->connected && strncmp(pl->name, name, MAX_NAME_LEN) == 0) {
+            int old_fd = pl->fd;
+            pl->fd = fd;
+            pthread_mutex_unlock(&L->mtx);
+            if (out_old_fd) *out_old_fd = old_fd;
+            return 0;
+        }
+    }
+
+    pthread_mutex_unlock(&L->mtx);
+    return -1;
+}
+
+/**
+ * Remove a player from the lobby pool by name, but only if the socket fd matches.
+ *
+ * This prevents a stale per-client thread (old fd) from removing a player after
+ * the same name has reconnected on a new socket.
+ *
+ * @param name        Player name.
+ * @param expected_fd Socket fd that must match the player's current fd.
+ * @return 0 if the player was removed; -1 otherwise.
+ */
+static int lobby_remove_player_by_name_if_fd(const char* name, int expected_fd) {
+    if (!name || !*name) return -1;
+    for (int i = 0; i < g_lobby_count; ++i) {
+        Lobby* L = &g_lobbies[i];
+        pthread_mutex_lock(&L->mtx);
+        for (int p = 0; p < LOBBY_SIZE; ++p) {
+            Player* pl = &L->players[p];
+            if (!pl->connected) continue;
+            if (strncmp(pl->name, name, MAX_NAME_LEN) != 0) continue;
+            if (pl->fd != expected_fd) {
+                pthread_mutex_unlock(&L->mtx);
+                return -1;
+            }
+            pl->connected = 0;
+            pl->name[0] = '\0';
+            pl->hand_size = 0;
+            pl->fd = -1;
+            L->player_count--;
+            pthread_mutex_unlock(&L->mtx);
+            return 0;
+        }
+        pthread_mutex_unlock(&L->mtx);
+    }
+    return -1;
+}
+
+/**
  * Parse a lobby selection line in the legacy format: "C45<name><lobby>\n".
  *
  * Note: for backward compatibility this parser treats ONLY the last digit as the lobby number.
@@ -600,14 +678,97 @@ static void* client_thread(void* arg) {
     // Reconnect path: first line is "C45RECONNECT <name> <lobby>\n"
     if (strncmp(line, "C45RECONNECT ", 13) == 0) {
         if (sscanf(line, "C45RECONNECT %63s %d", name, &lobby_num) != 2 ||
-            lobby_num < 1 || lobby_num > g_lobby_count) {
+            lobby_num < 0 || lobby_num > g_lobby_count) {
             write_all(cfd, "C45WRONG RECONNECT\n");
             client_fd_remove(cfd);
             close(cfd);
             return NULL;
         }
 
-        if (lobby_try_reconnect(lobby_num - 1, name, cfd) == 0) {
+        int li = (lobby_num > 0) ? (lobby_num - 1) : -1;
+
+        // 1) First try to resume a running game (requires fd == -1 for that player).
+        if (li >= 0) {
+            int reconnected = 0;
+            // Small grace period: the client may reconnect slightly faster than the game thread
+            // marks its old fd as disconnected (fd == -1). Wait briefly to avoid false failures.
+            const int wait_us_step = 50000;   // 50ms
+            const int wait_us_total = 3200000; // 3.2s (must stay below client handshake timeout)
+            for (int waited = 0; waited <= wait_us_total; waited += wait_us_step) {
+                if (lobby_try_reconnect(li, name, cfd) == 0) {
+                    reconnected = 1;
+                    break;
+                }
+
+                int running = 0;
+                int found = 0;
+                int cur_fd = -1;
+                Lobby* L = &g_lobbies[li];
+                pthread_mutex_lock(&L->mtx);
+                running = L->is_running;
+                for (int p = 0; p < LOBBY_SIZE; ++p) {
+                    Player* pl = &L->players[p];
+                    if (pl->connected && strncmp(pl->name, name, MAX_NAME_LEN) == 0) {
+                        found = 1;
+                        cur_fd = pl->fd;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&L->mtx);
+
+                if (!running || !found || cur_fd == -1) break;
+                usleep(wait_us_step);
+            }
+
+            if (reconnected) {
+                pthread_mutex_lock(&g_names_mtx);
+                if (!active_name_has(name)) {
+                    if (active_name_add(name) != 0) {
+                        pthread_mutex_unlock(&g_names_mtx);
+                        write_all(cfd, "C45WRONG RECONNECT\n");
+                        client_fd_remove(cfd);
+                        close(cfd);
+                        return NULL;
+                    }
+                }
+                my_token = active_name_set_fd(name, cfd);
+                pthread_mutex_unlock(&g_names_mtx);
+
+                write_all(cfd, "C45RECONNECT_OK\n");
+                printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+                goto game_wait;
+            }
+        } else {
+            for (int i = 0; i < g_lobby_count; ++i) {
+                if (lobby_try_reconnect(i, name, cfd) == 0) {
+                    li = i;
+                    lobby_num = i + 1;
+                    pthread_mutex_lock(&g_names_mtx);
+                    if (!active_name_has(name)) {
+                        if (active_name_add(name) != 0) {
+                            pthread_mutex_unlock(&g_names_mtx);
+                            write_all(cfd, "C45WRONG RECONNECT\n");
+                            client_fd_remove(cfd);
+                            close(cfd);
+                            return NULL;
+                        }
+                    }
+                    my_token = active_name_set_fd(name, cfd);
+                    pthread_mutex_unlock(&g_names_mtx);
+
+                    write_all(cfd, "C45RECONNECT_OK\n");
+                    printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+                    goto game_wait;
+                }
+            }
+        }
+
+        // 2) If the lobby is not running, allow reconnect during the waiting phase by taking over
+        // the lobby slot and continuing to wait for the game start.
+        int old_fd = -1;
+        if (li >= 0 && lobby_try_takeover_waiting(li, name, cfd, &old_fd) == 0) {
+            if (old_fd >= 0 && old_fd != cfd) (void)shutdown(old_fd, SHUT_RDWR);
+
             pthread_mutex_lock(&g_names_mtx);
             if (!active_name_has(name)) {
                 if (active_name_add(name) != 0) {
@@ -622,14 +783,99 @@ static void* client_thread(void* arg) {
             pthread_mutex_unlock(&g_names_mtx);
 
             write_all(cfd, "C45RECONNECT_OK\n");
-            printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
-            goto game_wait;
+            printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
+            start_game_if_ready(li);
+            goto wait_for_game_start;
         }
 
-        // If reconnection is impossible (game already finished) treat it as a normal login
-        // and immediately send the lobby snapshot instead of disconnecting the client.
+        if (li >= 0) {
+            // The client may have a stale lobby number; try to find the session elsewhere.
+            for (int i = 0; i < g_lobby_count; ++i) {
+                if (i == li) continue;
+                if (lobby_try_reconnect(i, name, cfd) == 0) {
+                    lobby_num = i + 1;
+                    printf("[NET] Reconnect lobby mismatch: '%s' requested #%d, found running in #%d\n",
+                           name, li + 1, lobby_num);
+
+                    pthread_mutex_lock(&g_names_mtx);
+                    if (!active_name_has(name)) {
+                        if (active_name_add(name) != 0) {
+                            pthread_mutex_unlock(&g_names_mtx);
+                            write_all(cfd, "C45WRONG RECONNECT\n");
+                            client_fd_remove(cfd);
+                            close(cfd);
+                            return NULL;
+                        }
+                    }
+                    my_token = active_name_set_fd(name, cfd);
+                    pthread_mutex_unlock(&g_names_mtx);
+
+                    write_all(cfd, "C45RECONNECT_OK\n");
+                    printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
+                    goto game_wait;
+                }
+            }
+
+            for (int i = 0; i < g_lobby_count; ++i) {
+                if (i == li) continue;
+                if (lobby_try_takeover_waiting(i, name, cfd, &old_fd) == 0) {
+                    if (old_fd >= 0 && old_fd != cfd) (void)shutdown(old_fd, SHUT_RDWR);
+                    lobby_num = i + 1;
+                    printf("[NET] Reconnect lobby mismatch: '%s' requested #%d, found waiting in #%d\n",
+                           name, li + 1, lobby_num);
+
+                    pthread_mutex_lock(&g_names_mtx);
+                    if (!active_name_has(name)) {
+                        if (active_name_add(name) != 0) {
+                            pthread_mutex_unlock(&g_names_mtx);
+                            write_all(cfd, "C45WRONG RECONNECT\n");
+                            client_fd_remove(cfd);
+                            close(cfd);
+                            return NULL;
+                        }
+                    }
+                    my_token = active_name_set_fd(name, cfd);
+                    pthread_mutex_unlock(&g_names_mtx);
+
+                    write_all(cfd, "C45RECONNECT_OK\n");
+                    printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
+                    start_game_if_ready(i);
+                    goto wait_for_game_start;
+                }
+            }
+        }
+
+        if (li < 0) {
+            for (int i = 0; i < g_lobby_count; ++i) {
+                if (lobby_try_takeover_waiting(i, name, cfd, &old_fd) == 0) {
+                    if (old_fd >= 0 && old_fd != cfd) (void)shutdown(old_fd, SHUT_RDWR);
+                    li = i;
+                    lobby_num = i + 1;
+
+                    pthread_mutex_lock(&g_names_mtx);
+                    if (!active_name_has(name)) {
+                        if (active_name_add(name) != 0) {
+                            pthread_mutex_unlock(&g_names_mtx);
+                            write_all(cfd, "C45WRONG RECONNECT\n");
+                            client_fd_remove(cfd);
+                            close(cfd);
+                            return NULL;
+                        }
+                    }
+                    my_token = active_name_set_fd(name, cfd);
+                    pthread_mutex_unlock(&g_names_mtx);
+
+                    write_all(cfd, "C45RECONNECT_OK\n");
+                    printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
+                    start_game_if_ready(li);
+                    goto wait_for_game_start;
+                }
+            }
+        }
+
+        // At this point we couldn't attach, but the name may still be present in a lobby.
+        // Do not pretend it's a fresh login: close and let the client retry.
         if (lobby_name_exists(name)) {
-            write_all(cfd, "C45WRONG NAME_TAKEN\n");
             client_fd_remove(cfd);
             close(cfd);
             return NULL;
@@ -779,16 +1025,18 @@ lobby_select:
         // Join OK for the Java client (its subsequent OKs)
         if (write_all(cfd, "C45OK\n") < 0) {
             printf("[ERR] Cannot send C45OK after adding (fd=%d)\n", cfd);
-            lobby_remove_player_by_name(name);
+            lobby_remove_player_by_name_if_fd(name, cfd);
             goto disconnect;
         }
 
         printf("[PROTO] -> C45OK '%s' in Lobby #%d (fd=%d)\n", name, lobby_num, cfd);
         start_game_if_ready(lobby_num - 1);
 
+wait_for_game_start:
 	        printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
 
 	        // wait until the game actually starts (or client cancels/disconnects)
+	        {
 	        time_t last_waiting_sent = 0;
 	        for (;;) {
 	            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
@@ -798,28 +1046,28 @@ lobby_select:
 
 	            time_t now = time(NULL);
 	            if (now - last_waiting_sent >= WAITING_INTERVAL_SEC) {
-	                if (write_all(cfd, "C45WAITING\n") < 0) {
-	                    printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
-	                    lobby_remove_player_by_name(name);
-	                    goto disconnect;
-	                }
+                    if (write_all(cfd, "C45WAITING\n") < 0) {
+                        printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
 	                last_waiting_sent = now;
 	            }
 
 	            struct pollfd pfd = { .fd = cfd, .events = POLLIN | POLLHUP | POLLERR };
 	            int pr = poll(&pfd, 1, 1000);
 	            if (pr == 0) continue;
-	            if (pr < 0) {
-	                if (errno == EINTR) continue;
-	                printf("[WAIT] poll failed while waiting (fd=%d)\n", cfd);
-	                lobby_remove_player_by_name(name);
-	                goto disconnect;
-	            }
-	            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
-	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
-	                lobby_remove_player_by_name(name);
-	                goto disconnect;
-	            }
+                    if (pr < 0) {
+                        if (errno == EINTR) continue;
+                        printf("[WAIT] poll failed while waiting (fd=%d)\n", cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
+                    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                        printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
 	            if (!(pfd.revents & POLLIN)) continue;
 
 	            // Re-check running before consuming any input to avoid stealing game traffic.
@@ -830,27 +1078,27 @@ lobby_select:
 
 	            char peekbuf[READ_BUF];
 	            ssize_t rr = recv(cfd, peekbuf, sizeof(peekbuf) - 1, MSG_PEEK | MSG_DONTWAIT);
-	            if (rr == 0) {
-	                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
-	                lobby_remove_player_by_name(name);
-	                goto disconnect;
-	            }
-	            if (rr < 0) {
-	                if (errno == EINTR) continue;
-	                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-	                printf("[WAIT] recv peek failed while waiting (fd=%d)\n", cfd);
-	                lobby_remove_player_by_name(name);
-	                goto disconnect;
-	            }
+                    if (rr == 0) {
+                        printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
+                    if (rr < 0) {
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+                        printf("[WAIT] recv peek failed while waiting (fd=%d)\n", cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
 	            peekbuf[rr] = '\0';
 	            if (!strchr(peekbuf, '\n')) continue; // wait for a complete line
 
 		            int r = read_line(cfd, line, sizeof(line));
-		            if (r <= 0) {
-		                printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
-		                lobby_remove_player_by_name(name);
-		                goto disconnect;
-		            }
+                    if (r <= 0) {
+                        printf("[WAIT] '%s' disconnected while waiting (fd=%d)\n", name, cfd);
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        goto disconnect;
+                    }
 
 		            if (is_token(line, "C45PING")) {
 		                (void)write_all(cfd, "C45PONG\n");
@@ -860,18 +1108,18 @@ lobby_select:
 		            if (strncmp(line, "C45YES", 6) == 0) continue;
 
 		            int br = is_back_request_for(line, name);
-		            if (br == 1) {
-	                // Cancel waiting: remove from lobby and return to lobby selection
-	                lobby_remove_player_by_name(name);
-	                if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
-	                goto next_round;
-	            }
-	            // Any other line while waiting is a protocol error.
-	            write_all(cfd, "C45WRONG\n");
-	            lobby_remove_player_by_name(name);
-	            goto disconnect;
+                    if (br == 1) {
+                        // Cancel waiting: remove from lobby and return to lobby selection
+                        lobby_remove_player_by_name_if_fd(name, cfd);
+                        if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+                        goto next_round;
+                    }
+                    // Any other line while waiting is a protocol error.
+                    write_all(cfd, "C45WRONG\n");
+                    lobby_remove_player_by_name_if_fd(name, cfd);
+                    goto disconnect;
 	        }
-
+	        }
         printf("[GAME] '%s' Game started in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
 game_wait:
         wait_lobby_running_change(lobby_num - 1, 0); // wait game end

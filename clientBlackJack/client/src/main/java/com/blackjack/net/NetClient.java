@@ -574,7 +574,9 @@ public class NetClient {
                 if (lobby > 0) {
                     sendRaw("C45RECONNECT " + n + " " + lobby + "\n");
                 } else {
-                    sendRaw("C45" + n + "\n");
+                    // Reconnect even if the user hasn't selected a lobby yet.
+                    // The server treats lobby=0 as "resume to lobby list if not in a game".
+                    sendRaw("C45RECONNECT " + n + " 0\n");
                 }
                 lastConnectFailureHint = null;
                 return true;

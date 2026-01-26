@@ -11,7 +11,7 @@ All messages are sent over TCP as text lines and must end with `\n`.
 
 ## Connect (client -> server)
 - `C45<name>\n` — first handshake
-- `C45RECONNECT <name> <lobby>\n` — reconnect to running game
+- `C45RECONNECT <name> <lobby>\n` — reconnect/resume session (`lobby=0` means "unknown; resume to lobby list if not in a game")
 
 ## Lobby (client -> server)
 - `C45<name><lobby>\n` — join lobby
@@ -31,4 +31,5 @@ All messages are sent over TCP as text lines and must end with `\n`.
 ## Basic server responses
 - `C45OK\n` — everything is ok
 - `C45WRONG...\n` — protocol error / invalid request
+- `C45RECONNECT_OK\n` — reconnect accepted (game will resume or client will continue waiting)
 - `C45SERVER_DOWN [reason]\n` — server is shutting down; client should disconnect
