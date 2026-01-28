@@ -44,7 +44,7 @@
 
 #define ACTIVE_MAX 256
 #define CLIENT_FD_MAX 1024
-#define WAITING_INTERVAL_SEC 5
+#define WAITING_INTERVAL_SEC 10
 // Reserving names among all active connections (until disconnect)
 static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_active_names[ACTIVE_MAX][MAX_NAME_LEN];
@@ -657,7 +657,7 @@ static void* client_thread(void* arg) {
             return NULL;
         }
         if (!is_c45_prefix(line)) {
-            printf("[PROTO] Wrong handshake from fd=%d: \"%s\" -> C45WRONG\n", cfd, line);
+            printf("[PROTO] Wrong handshake from fd=%d -> C45WRONG\n", cfd);
             write_all(cfd, "C45WRONG\n");
             client_fd_remove(cfd);
             close(cfd);

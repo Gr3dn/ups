@@ -27,14 +27,18 @@ public class NetClient {
     private final int port;
     private final int connectTimeoutMs;
 
+    // Toggle low-level network I/O debug printing (very noisy).
+    private static final boolean DEBUG_IO = false;
+
     // Client-side timeouts are what make the UI react quickly when the server process/machine disappears.
     // Keep HEARTBEAT_INTERVAL_MS <= SERVER_SILENCE_TIMEOUT_MS to avoid false "server not responding"
     // while the connection is simply idle.
     private static final int SOCKET_READ_TIMEOUT_MS = 1000;
     private static final int HEARTBEAT_INTERVAL_MS = 3000;
-    private static final int SERVER_SILENCE_TIMEOUT_MS = 4000;
-    private static final int PONG_RESPONSE_TIMEOUT_MS = 3000;
+    private static final int SERVER_SILENCE_TIMEOUT_MS = 10000;
+    private static final int PONG_RESPONSE_TIMEOUT_MS = 10000;
     private static final int HANDSHAKE_TIMEOUT_MS = 4000;
+    private static final int LOBBY_SNAPSHOT_TIMEOUT_MS = 16000;
     private static final int RECONNECT_WINDOW_MS = 16000;
     private static final int RECONNECT_MAX_ATTEMPTS = 8;
     private static final int RECONNECT_CONNECT_TIMEOUT_MS = 1000;
@@ -55,6 +59,7 @@ public class NetClient {
     private volatile long handshakeSentMs = 0L;
     private volatile boolean handshakeDone = false;
     private volatile String lastConnectFailureHint = null;
+    private volatile long lobbySnapshotExpectedMs = 0L;
 
     private enum State {
         WAIT_OK,
@@ -185,8 +190,18 @@ public class NetClient {
                         }
                     String t = line.trim();
                     lastServerMessageMs = System.currentTimeMillis();
-                    System.out.println(t);
+                    if (DEBUG_IO) System.out.println(t);
                     if (t.isEmpty()) continue;
+
+                    long now = lastServerMessageMs;
+                    if (state == State.WAIT_LOBBIES &&
+                            lobbySnapshotExpectedMs > 0 &&
+                            now - lobbySnapshotExpectedMs > LOBBY_SNAPSHOT_TIMEOUT_MS &&
+                            !t.startsWith("C45LOBBIES")) {
+                        l.onServerError("Server did not send lobby list.");
+                        closeQuietly();
+                        return;
+                    }
 
                     if (t.startsWith("C45PONG")) {
                         awaitingPong = false;
@@ -239,6 +254,7 @@ public class NetClient {
                             ensureState(t, State.WAIT_OK);
                             state = State.WAIT_LOBBIES;
                             expectLobbySnapshot = true;
+                            lobbySnapshotExpectedMs = System.currentTimeMillis();
                             l.onOk();
                             handshakeDone = true;
                         } else if (state == State.LOBBY_CHOICE) {
@@ -279,6 +295,7 @@ public class NetClient {
                         l.onLobbySnapshot(rows);
                         state = State.LOBBY_CHOICE;
                         expectLobbySnapshot = false;
+                        lobbySnapshotExpectedMs = 0L;
                         continue;
                     }
 
@@ -356,6 +373,13 @@ public class NetClient {
                 } catch (SocketTimeoutException ste) {
                     if (closing) return;
                     long now = System.currentTimeMillis();
+                    if (state == State.WAIT_LOBBIES &&
+                            lobbySnapshotExpectedMs > 0 &&
+                            now - lobbySnapshotExpectedMs > LOBBY_SNAPSHOT_TIMEOUT_MS) {
+                        l.onServerError("Server did not send lobby list.");
+                        closeQuietly();
+                        return;
+                    }
                     if (!handshakeDone && handshakeSentMs > 0 &&
                             now - handshakeSentMs > HANDSHAKE_TIMEOUT_MS) {
                         if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
@@ -436,7 +460,7 @@ public class NetClient {
      * @param s Line to send.
      */
     public synchronized void sendRaw(String s) throws IOException {
-        System.out.println(s);
+        if (DEBUG_IO) System.out.println(s);
         os.write(s.getBytes(StandardCharsets.UTF_8)); os.flush(); }
 
     /**
@@ -450,6 +474,7 @@ public class NetClient {
         handshakeSentMs = System.currentTimeMillis();
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
+        lobbySnapshotExpectedMs = 0L;
         sendRaw("C45" + name + "\n");
     }
 
@@ -464,7 +489,6 @@ public class NetClient {
         lastLobby = lobby;
         state = State.LOBBY_CHOICE;
         sendRaw("C45" + name + lobby + "\n");
-        System.out.println(lobby);
     }
 
     /** Send {@code C45HIT}. */
@@ -507,6 +531,7 @@ public class NetClient {
         handshakeSentMs = System.currentTimeMillis();
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
+        lobbySnapshotExpectedMs = 0L;
         sendRaw("C45RECONNECT " + name + " " + lobby + "\n");
     }
 
@@ -537,6 +562,7 @@ public class NetClient {
         lastPingMs = 0L;
         lastPingSentMs = 0L;
         awaitingPong = false;
+        lobbySnapshotExpectedMs = 0L;
     }
 
     /**
@@ -554,6 +580,7 @@ public class NetClient {
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
         handshakeDone = false;
+        lobbySnapshotExpectedMs = 0L;
 
         long deadline = System.currentTimeMillis() + Math.max(0L, windowMs);
         long perAttemptMs = Math.max(1L, windowMs / Math.max(1, maxAttempts));
@@ -563,7 +590,7 @@ public class NetClient {
             long attemptStart = System.currentTimeMillis();
             try {
                 attempts++;
-                System.out.println("Reccon attempt: " + attempts);
+                if (DEBUG_IO) System.out.println("Reconnect attempt: " + attempts);
                 Socket s = new Socket();
                 int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
                 long remaining = deadline - System.currentTimeMillis();

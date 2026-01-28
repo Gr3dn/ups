@@ -301,10 +301,9 @@ public class MainApp extends Application {
      */
     private Scene buildLobbyWaitingScene(String message) {
         Label lbl = new Label(message == null ? "" : message);
-        ProgressIndicator pi = new ProgressIndicator();
-        pi.setPrefSize(48, 48);
-
-        VBox mid = new VBox(12, lbl, pi);
+        // Avoid indeterminate progress animations here: on some systems (software rendering)
+        // they can consume significant CPU while waiting for network data.
+        VBox mid = new VBox(12, lbl);
         mid.setAlignment(Pos.CENTER);
 
         VBox root = new VBox(20, mid);
