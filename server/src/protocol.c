@@ -101,26 +101,45 @@ int is_c45_prefix(const char* s) {
  * @return 0 on success; -1 on error.
  */
 int send_lobbies_snapshot(int fd) {
-    char line[128];
-    sleep(2);
-    char hdr[64];
-    snprintf(hdr, sizeof(hdr), "C45LOBBIES %d\n", g_lobby_count);
-    if (write_all(fd, hdr) < 0) return -1;
+    // Compact snapshot (single line) to keep the protocol usable under extreme
+    // fragmentation/delay (e.g., 1 byte per packet, high RTT).
+    //
+    // Format:
+    //   C45L <n> <pairs>\n
+    // where <pairs> is 2*n digits, each pair is:
+    //   players (0..2) + status (0/1)
+    //
+    // Example for 3 lobbies:
+    //   C45L 3 001020\n
+    char out[512];
+    int n = g_lobby_count;
+    if (n < 0) n = 0;
+    if (n > 200) n = 200; // bound the line length; the Java client also limits lobby count
 
-    for (int i = 0; i < g_lobby_count; ++i) {
+    int pos = snprintf(out, sizeof(out), "C45L %d ", n);
+    if (pos < 0 || (size_t)pos >= sizeof(out)) return -1;
+
+    for (int i = 0; i < n; ++i) {
         int players, status;
         pthread_mutex_lock(&g_lobbies[i].mtx);
         players = g_lobbies[i].player_count;
         status  = g_lobbies[i].is_running ? 1 : 0;
         pthread_mutex_unlock(&g_lobbies[i].mtx);
 
-        snprintf(line, sizeof(line),
-                 "C45LOBBY %d players=%d/%d status=%d\n",
-                 i+1, players, LOBBY_SIZE, status);
-        if (write_all(fd, line) < 0) return -1;
-    }
-    if (write_all(fd, "C45END\n") < 0) return -1;
+        if (players < 0) players = 0;
+        if (players > 9) players = 9;
+        status = status ? 1 : 0;
 
+        if ((size_t)(pos + 2) >= sizeof(out)) return -1;
+        out[pos++] = (char)('0' + players);
+        out[pos++] = (char)('0' + status);
+    }
+
+    if ((size_t)(pos + 2) >= sizeof(out)) return -1;
+    out[pos++] = '\n';
+    out[pos] = '\0';
+
+    if (write_all(fd, out) < 0) return -1;
     printf("[PROTO] -> Send lobby snapshot to client (fd=%d)\n", fd);
     return 0;
 }

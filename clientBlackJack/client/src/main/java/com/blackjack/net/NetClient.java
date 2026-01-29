@@ -37,10 +37,10 @@ public class NetClient {
     private static final int HEARTBEAT_INTERVAL_MS = 3000;
     private static final int SERVER_SILENCE_TIMEOUT_MS = 10000;
     private static final int PONG_RESPONSE_TIMEOUT_MS = 10000;
-    private static final int HANDSHAKE_TIMEOUT_MS = 4000;
+    private static final int HANDSHAKE_TIMEOUT_MS = 10000;
     private static final int LOBBY_SNAPSHOT_TIMEOUT_MS = 16000;
-    private static final int RECONNECT_WINDOW_MS = 16000;
-    private static final int RECONNECT_MAX_ATTEMPTS = 8;
+    private static final int RECONNECT_WINDOW_MS = 40000;
+    private static final int RECONNECT_MAX_ATTEMPTS = 20;
     private static final int RECONNECT_CONNECT_TIMEOUT_MS = 1000;
 
     private Socket socket;
@@ -193,26 +193,18 @@ public class NetClient {
                     if (DEBUG_IO) System.out.println(t);
                     if (t.isEmpty()) continue;
 
-                    long now = lastServerMessageMs;
-                    if (state == State.WAIT_LOBBIES &&
-                            lobbySnapshotExpectedMs > 0 &&
-                            now - lobbySnapshotExpectedMs > LOBBY_SNAPSHOT_TIMEOUT_MS &&
-                            !t.startsWith("C45LOBBIES")) {
-                        l.onServerError("Server did not send lobby list.");
-                        closeQuietly();
-                        return;
-                    }
-
-                    if (t.startsWith("C45PONG")) {
+                    if (t.startsWith("C45PO") || t.startsWith("C45PONG")) {
                         awaitingPong = false;
                         continue;
                     }
-                    if (t.startsWith("C45PING")) {
+                    if (t.startsWith("C45PI") || t.startsWith("C45PING")) {
                         try { sendPong(); } catch (IOException ignored) {}
                         continue;
                     }
-                    if (t.startsWith("C45SERVER_DOWN")) {
-                        String reason = t.substring("C45SERVER_DOWN".length()).trim();
+                    if (t.startsWith("C45DOWN") || t.startsWith("C45SERVER_DOWN")) {
+                        String reason = t.startsWith("C45DOWN")
+                                ? t.substring("C45DOWN".length()).trim()
+                                : t.substring("C45SERVER_DOWN".length()).trim();
                         String msg = reason.isEmpty()
                                 ? "Server shut down"
                                 : "Server shut down: " + reason;
@@ -220,15 +212,16 @@ public class NetClient {
                         closeQuietly();
                         return;
                     }
-                    if (t.startsWith("C45RECONNECT_OK")) {
+                    if (t.startsWith("C45REC_OK") || t.startsWith("C45RECONNECT_OK")) {
                         // We are back on the server. It can either resume the game (hand snapshot)
                         // or (if the game already ended) send a normal lobby snapshot.
                         state = State.LOBBY_WAIT_OR_GAME;
                         expectLobbySnapshot = true;
                         handshakeDone = true;
+                        l.onReconnectSucceeded();
                         continue;
                     }
-                    if (t.startsWith("C45OPPDOWN")) {
+                    if (t.startsWith("C45OD") || t.startsWith("C45OPPDOWN")) {
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME, State.AFTER_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
@@ -237,7 +230,7 @@ public class NetClient {
                         l.onOpponentDisconnected(who, sec);
                         continue;
                     }
-                    if (t.startsWith("C45OPPBACK")) {
+                    if (t.startsWith("C45OB") || t.startsWith("C45OPPBACK")) {
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         String[] p = t.split("\\s+");
                         String who = (p.length >= 2) ? p[1] : "Enemy";
@@ -277,7 +270,42 @@ public class NetClient {
                         return;
                     }
 
-                    // Lobby snapshot
+                    // Lobby snapshot (compact single-line format)
+                    //   C45L <n> <pairs>
+                    // where <pairs> is 2*n digits: players(0..2) + status(0/1).
+                    if (t.startsWith("C45L ")) {
+                        if (!expectLobbySnapshot && state != State.WAIT_LOBBIES) {
+                            throw new ProtocolException("Unexpected lobby snapshot: " + t);
+                        }
+                        String[] p = t.split("\\s+");
+                        if (p.length < 3) throw new ProtocolException("Bad C45L snapshot: " + t);
+                        int n = parsePositiveInt(p[1], "lobby count");
+                        if (n > 100) throw new ProtocolException("Too many lobbies: " + n);
+                        String pairs = p[2];
+                        if (pairs.length() != 2 * n) {
+                            throw new ProtocolException("Bad C45L snapshot length: " + t);
+                        }
+
+                        List<LobbyRow> rows = new ArrayList<>();
+                        for (int i = 0; i < n; i++) {
+                            char pc = pairs.charAt(i * 2);
+                            char sc = pairs.charAt(i * 2 + 1);
+                            if (!Character.isDigit(pc) || !Character.isDigit(sc)) {
+                                throw new ProtocolException("Bad C45L snapshot digits: " + t);
+                            }
+                            int players = pc - '0';
+                            int status = sc - '0';
+                            rows.add(new LobbyRow(i + 1, players, 2, String.valueOf(status)));
+                        }
+
+                        l.onLobbySnapshot(rows);
+                        state = State.LOBBY_CHOICE;
+                        expectLobbySnapshot = false;
+                        lobbySnapshotExpectedMs = 0L;
+                        continue;
+                    }
+
+                    // Legacy lobby snapshot (multi-line format)
                     if (t.startsWith("C45LOBBIES")) {
                         if (!expectLobbySnapshot && state != State.WAIT_LOBBIES) {
                             throw new ProtocolException("Unexpected lobby snapshot: " + t);
@@ -300,48 +328,69 @@ public class NetClient {
                     }
 
                     // gameplay
-                    if (t.startsWith("C45DEAL")) {
+                    if (t.startsWith("C45D ") || t.startsWith("C45DEAL")) {
                         String[] p = t.split("\\s+");
-                        if (p.length < 3) throw new ProtocolException("Bad C45DEAL: " + t);
+                        if (p.length < 3) throw new ProtocolException("Bad DEAL: " + t);
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
                         l.onDeal(p[1], p[2]);
                         state = State.IN_GAME;
                         continue;
                     }
-                    if (t.startsWith("C45TURN")) {
+                    if (t.startsWith("C45T ") || t.startsWith("C45TURN")) {
                         String[] p = t.split("\\s+");
-                        if (p.length < 3) throw new ProtocolException("Bad C45TURN: " + t);
+                        if (p.length < 3) throw new ProtocolException("Bad TURN: " + t);
                         ensureStateIn(t, State.IN_GAME);
                         String who = (p.length >= 2) ? p[1] : "?";
                         int sec = parsePositiveInt(p[2], "turn seconds");
                         if (sec > 300) throw new ProtocolException("Bad turn seconds: " + sec);
                         l.onTurn(who, sec); continue;
                     }
-                    if (t.startsWith("C45CARD")) {
+                    if (t.startsWith("C45C ") || t.startsWith("C45CARD")) {
                         String[] p = t.split("\\s+");
                         ensureStateIn(t, State.IN_GAME);
                         if (p.length >= 2) l.onCard(p[1]); continue;
                     }
-                    if (t.startsWith("C45BUST")) {
+                    if (t.startsWith("C45B ") || t.startsWith("C45BUST")) {
                         String[] p = t.split("\\s+");
-                        if (p.length < 3) throw new ProtocolException("Bad C45BUST: " + t);
+                        if (p.length < 3) throw new ProtocolException("Bad BUST: " + t);
                         ensureStateIn(t, State.IN_GAME);
                         if (p.length >= 3) l.onBust(p[1], Integer.parseInt(p[2])); continue;
                     }
-                    if (t.startsWith("C45TIMEOUT")) {
+                    if (t.startsWith("C45TO") || t.startsWith("C45TIMEOUT")) {
                         ensureStateIn(t, State.IN_GAME);
                         continue;
                     }
-                    if (t.startsWith("C45RESULT")) {
+                    if (t.startsWith("C45R ") || t.startsWith("C45RESULT")) {
                         ensureStateIn(t, State.LOBBY_WAIT_OR_GAME, State.IN_GAME);
-                        String data = t.substring("C45RESULT".length()).trim();
-                        String[] parts = data.split(" ");
-                        if (parts.length < 6) throw new ProtocolException("Bad C45RESULT: " + t);
-                        String p1     = parts[0];
-                        String score1 = parts[1];
-                        String p2     = parts[2];
-                        String score2 = parts[3];
-                        String winner = parts[5];
+                        String[] parts = t.split("\\s+");
+                        final String p1;
+                        final String score1;
+                        final String p2;
+                        final String score2;
+                        final String winner;
+                        if (t.startsWith("C45RESULT")) {
+                            if (parts.length < 7) {
+                                // If the TCP connection drops mid-line, BufferedReader can return a partial line at EOF.
+                                // Treat this as a transport failure and let the reconnect logic handle it.
+                                throw new EOFException("Incomplete RESULT: " + t);
+                            }
+                            p1 = parts[1];
+                            score1 = parts[2];
+                            p2 = parts[3];
+                            score2 = parts[4];
+                            winner = parts[6];
+                        } else {
+                            if (parts.length < 6) {
+                                // If the TCP connection drops mid-line, BufferedReader can return a partial line at EOF.
+                                // Treat this as a transport failure and let the reconnect logic handle it.
+                                throw new EOFException("Incomplete RESULT: " + t);
+                            }
+                            p1 = parts[1];
+                            score1 = parts[2];
+                            p2 = parts[3];
+                            score2 = parts[4];
+                            winner = parts[5];
+                        }
 
                         String header = winner.equalsIgnoreCase("PUSH")
                                 ? "Draw. Nobody won."
@@ -353,19 +402,6 @@ public class NetClient {
 
                         l.onResult(result);
                         state = State.AFTER_GAME;
-                        continue;
-                    }
-                    if (t.startsWith("C45WAITING")) {
-                        ensureStateIn(t, State.LOBBY_WAIT_OR_GAME);
-                        try {
-                            sendYes();
-                        } catch (IOException ioe) {
-                            l.onServerError("send C45YES failed: " + ioe.getMessage());
-                        }
-                        continue;
-                    }
-
-                    if (t.startsWith("C45END")) {
                         continue;
                     }
 
@@ -382,7 +418,7 @@ public class NetClient {
                     }
                     if (!handshakeDone && handshakeSentMs > 0 &&
                             now - handshakeSentMs > HANDSHAKE_TIMEOUT_MS) {
-                        if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                        if (tryReconnect(l, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
                         l.onServerError(autoReconnectFailedMessage());
                         closeQuietly();
                         return;
@@ -396,7 +432,7 @@ public class NetClient {
 
                         // Primary signal: we sent PING but didn't receive PONG in time.
                         if (awaitingPong && (now - lastPingSentMs > PONG_RESPONSE_TIMEOUT_MS)) {
-                            if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                            if (tryReconnect(l, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
                             l.onServerError(autoReconnectFailedMessage());
                             closeQuietly();
                             return;
@@ -404,7 +440,7 @@ public class NetClient {
 
                         // Fallback: no server messages at all for too long.
                         if (now - lastServerMessageMs > SERVER_SILENCE_TIMEOUT_MS) {
-                            if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
+                            if (tryReconnect(l, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) continue;
                             l.onServerError(autoReconnectFailedMessage());
                             closeQuietly();
                             return;
@@ -433,7 +469,7 @@ public class NetClient {
                     return;
                 } catch (Exception ex) {
                     if (closing) return;
-                    if (tryReconnect(RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) {
+                    if (tryReconnect(l, RECONNECT_WINDOW_MS, RECONNECT_MAX_ATTEMPTS)) {
 
                         continue;
                     }
@@ -479,7 +515,9 @@ public class NetClient {
     }
 
     /**
-     * Send a lobby join request using the legacy command format: {@code C45<name><lobby>\n}.
+     * Send a lobby join request.
+     *
+     * Format: {@code C45J <lobby>\n} (name is implicit after the handshake).
      *
      * @param name  Player name.
      * @param lobby 1-based lobby number.
@@ -488,21 +526,19 @@ public class NetClient {
         lastName = name;
         lastLobby = lobby;
         state = State.LOBBY_CHOICE;
-        sendRaw("C45" + name + lobby + "\n");
+        sendRaw("C45J " + lobby + "\n");
     }
 
-    /** Send {@code C45HIT}. */
-    public void sendHit() throws IOException { sendRaw("C45HIT\n"); }
-    /** Send {@code C45STAND}. */
-    public void sendStand() throws IOException { sendRaw("C45STAND\n"); }
-    /** Send {@code C45YES}. */
-    public void sendYes() throws IOException { sendRaw("C45YES\n"); }
-    /** Send {@code C45PONG}. */
-    public void sendPong() throws IOException { sendRaw("C45PONG\n"); }
-    /** Send {@code C45PING}. */
+    /** Send {@code C45H}. */
+    public void sendHit() throws IOException { sendRaw("C45H\n"); }
+    /** Send {@code C45S}. */
+    public void sendStand() throws IOException { sendRaw("C45S\n"); }
+    /** Send {@code C45PO} (PONG). */
+    public void sendPong() throws IOException { sendRaw("C45PO\n"); }
+    /** Send {@code C45PI} (PING). */
     public void sendPing() throws IOException {
         long now = System.currentTimeMillis();
-        sendRaw("C45PING\n");
+        sendRaw("C45PI\n");
         awaitingPong = true;
         lastPingSentMs = now;
     }
@@ -514,7 +550,7 @@ public class NetClient {
      */
     public void sendBackToLobby(String name) throws IOException {
         expectLobbySnapshot = true;
-        sendRaw("C45" + (name == null ? "" : name) + "back\n");
+        sendRaw("C45B\n");
     }
 
     /**
@@ -532,7 +568,7 @@ public class NetClient {
         state = State.WAIT_OK;
         expectLobbySnapshot = true;
         lobbySnapshotExpectedMs = 0L;
-        sendRaw("C45RECONNECT " + name + " " + lobby + "\n");
+        sendRaw("C45REC " + name + " " + lobby + "\n");
     }
 
     /**
@@ -571,7 +607,7 @@ public class NetClient {
      * @param windowMs Max time spent reconnecting.
      * @return true if reconnection succeeded; false otherwise.
      */
-    private boolean tryReconnect(long windowMs, int maxAttempts) {
+    private boolean tryReconnect(ProtocolListener l, long windowMs, int maxAttempts) {
         String n = lastName;
         int lobby = lastLobby;
         if (n == null || n.isBlank()) return false;
@@ -590,6 +626,7 @@ public class NetClient {
             long attemptStart = System.currentTimeMillis();
             try {
                 attempts++;
+                l.onReconnectAttempt(attempts, maxAttempts);
                 if (DEBUG_IO) System.out.println("Reconnect attempt: " + attempts);
                 Socket s = new Socket();
                 int to = Math.min(connectTimeoutMs, RECONNECT_CONNECT_TIMEOUT_MS);
@@ -599,11 +636,11 @@ public class NetClient {
                 replaceConnection(s);
                 handshakeSentMs = System.currentTimeMillis();
                 if (lobby > 0) {
-                    sendRaw("C45RECONNECT " + n + " " + lobby + "\n");
+                    sendRaw("C45REC " + n + " " + lobby + "\n");
                 } else {
                     // Reconnect even if the user hasn't selected a lobby yet.
                     // The server treats lobby=0 as "resume to lobby list if not in a game".
-                    sendRaw("C45RECONNECT " + n + " 0\n");
+                    sendRaw("C45REC " + n + " 0\n");
                 }
                 lastConnectFailureHint = null;
                 return true;

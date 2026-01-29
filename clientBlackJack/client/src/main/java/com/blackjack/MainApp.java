@@ -363,7 +363,7 @@ public class MainApp extends Application {
             new Thread(() -> {
                 try {
                     if (client == null) throw new SocketException("Connection broke");
-                    // Compatible with the current server: "C45" + name + lobbyNum + "\n"
+                    // Protocol: "C45J <lobby>\n" (name is implicit after the handshake)
                     client.sendJoin(Objects.requireNonNullElse(name, ""), num);
                     Platform.runLater(() -> status.setText("Send: " + num));
                     // Join confirmation is delivered via onLobbyJoinOk() from the protocol listener.
@@ -442,6 +442,26 @@ public class MainApp extends Application {
                 String reason = (msg == null || msg.isBlank()) ? "Server ERROR" : msg;
                 System.out.println(msg);
                 Platform.runLater(() -> goToConnectScene("Connection lost: " + reason));
+            }
+
+            @Override
+            public void onReconnectAttempt(int attempt, int maxAttempts) {
+                Platform.runLater(() -> {
+                    if (gameView != null) {
+                        gameView.showReconnectStatus(
+                                "No connection. Reconnecting " + attempt + "/" + maxAttempts + "..."
+                        );
+                    }
+                });
+            }
+
+            @Override
+            public void onReconnectSucceeded() {
+                Platform.runLater(() -> {
+                    if (gameView != null) {
+                        gameView.hideReconnectStatus();
+                    }
+                });
             }
 
             // --- game phase ---

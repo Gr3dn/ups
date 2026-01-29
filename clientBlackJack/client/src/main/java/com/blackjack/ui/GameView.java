@@ -29,6 +29,7 @@ import javafx.scene.layout.*;
 public class GameView {
     private final VBox root = new VBox(10);
     private final Label header = new Label();
+    private final Label reconnectStatus = new Label();
     private final Label scoreLabel = new Label();
     private final TextArea log = new TextArea();
     private final Button hit = new Button("HIT");
@@ -39,6 +40,7 @@ public class GameView {
     private String myName;
     private final List<String> hand = new ArrayList<>();
     private boolean matchEnded = false;
+    private boolean restoringHandSnapshot = false;
 
     /**
      * Create a game view for a given lobby number.
@@ -48,11 +50,14 @@ public class GameView {
     public GameView(int lobbyNum) {
         header.setStyle("-fx-font-size:18px;-fx-font-weight:bold;");
         header.setText("Lobby #" + lobbyNum + " — Game");
+        reconnectStatus.setStyle("-fx-text-fill:#b00020;-fx-font-weight:bold;");
+        reconnectStatus.setVisible(false);
+        reconnectStatus.setManaged(false);
         scoreLabel.setStyle("-fx-font-size:18px;");
         scoreLabel.setText("Total score: 0");
         log.setEditable(false); log.setPrefRowCount(14);
         HBox actions = new HBox(8, hit, stand, backToLobby);
-        root.getChildren().addAll(header, scoreLabel, log, actions);
+        root.getChildren().addAll(header, reconnectStatus, scoreLabel, log, actions);
         root.setPadding(new Insets(12));
 
         hit.setOnAction(e -> { setTurnEnabled(false); sendAsync(() -> client.sendHit()); });
@@ -75,6 +80,30 @@ public class GameView {
     public void bindClient(NetClient c) { this.client = c; }
 
     /**
+     * Show a connection/reconnect status text inside the game view.
+     *
+     * Must be called from the JavaFX thread.
+     *
+     * @param text Status text (null is treated as empty).
+     */
+    public void showReconnectStatus(String text) {
+        reconnectStatus.setText(text == null ? "" : text);
+        reconnectStatus.setVisible(true);
+        reconnectStatus.setManaged(true);
+    }
+
+    /**
+     * Hide the connection/reconnect status text.
+     *
+     * Must be called from the JavaFX thread.
+     */
+    public void hideReconnectStatus() {
+        reconnectStatus.setText("");
+        reconnectStatus.setVisible(false);
+        reconnectStatus.setManaged(false);
+    }
+
+    /**
      * Set callback invoked when user clicks "Back to Lobby".
      *
      * @param r Runnable callback.
@@ -95,14 +124,18 @@ public class GameView {
      * @param c2 Second card.
      */
     public void onDeal(String c1, String c2){
+        boolean isSnapshot = !matchEnded && !hand.isEmpty();
         matchEnded = false;
+        restoringHandSnapshot = isSnapshot;
         setBackEnabled(false);
         backToLobby.setText("Back to Lobby");
         hand.clear();
         addCardToHand(c1);
         addCardToHand(c2);
         updateScore();
-        append("Your cards: " + formatCard(c1) + " " + formatCard(c2));
+        if (!isSnapshot) {
+            append("Your cards: " + formatCard(c1) + " " + formatCard(c2));
+        }
     }
 
     /**
@@ -112,6 +145,10 @@ public class GameView {
      * @param sec Turn timeout in seconds.
      */
     public void onTurn(String who, int sec){
+        if (restoringHandSnapshot) {
+            append("Reconnected. Game state restored.");
+            restoringHandSnapshot = false;
+        }
         append("Move: " + who + " (" + sec + "s)");
         if (!matchEnded) {
             // If we previously offered "Leave Lobby" while the opponent was disconnected,
@@ -130,7 +167,9 @@ public class GameView {
     public void onCard(String c){
         addCardToHand(c);
         updateScore();
-        append("You take: " + formatCard(c));
+        if (!restoringHandSnapshot) {
+            append("You take: " + formatCard(c));
+        }
     }
 
     /**
@@ -186,6 +225,7 @@ public class GameView {
      */
     public void onResult(String s){
         matchEnded = true;
+        restoringHandSnapshot = false;
         System.out.println(s);
         append("Result: " + s);
         setTurnEnabled(false);

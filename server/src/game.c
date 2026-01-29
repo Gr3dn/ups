@@ -29,10 +29,10 @@
 #include <poll.h>
 #include <sys/socket.h>
 
-#define TURN_TIMEOUT_SEC       30
-#define RECONNECT_TIMEOUT_SEC  30
-#define PING_INTERVAL_SEC      5
-#define PONG_TIMEOUT_SEC       10
+#define TURN_TIMEOUT_SEC       60
+#define RECONNECT_TIMEOUT_SEC  60
+#define PING_INTERVAL_SEC      10
+#define PONG_TIMEOUT_SEC       15
 
 Lobby* g_lobbies = NULL;
 int    g_lobby_count = 5; // default value
@@ -46,7 +46,7 @@ static void* lobby_game_thread(void* arg);
  * end-of-string or whitespace.
  *
  * @param line Full received line (NUL-terminated).
- * @param tok  Token string to match (e.g. "C45PING").
+ * @param tok  Token string to match (e.g. "C45PI").
  * @return 1 if @p line begins with @p tok and is followed by end/whitespace; 0 otherwise.
  */
 static int is_token(const char* line, const char* tok) {
@@ -369,13 +369,13 @@ static void send_hand_snapshot(int fd, const Card* hand, int hand_size) {
     char c1[3], c2[3], line[128];
     card_to_str(hand[0], c1);
     card_to_str(hand[1], c2);
-    snprintf(line, sizeof(line), "C45DEAL %s %s\n", c1, c2);
+    snprintf(line, sizeof(line), "C45D %s %s\n", c1, c2);
     write_all(fd, line);
 
     for (int i = 2; i < hand_size; ++i) {
         char cs[3];
         card_to_str(hand[i], cs);
-        snprintf(line, sizeof(line), "C45CARD %s\n", cs);
+        snprintf(line, sizeof(line), "C45C %s\n", cs);
         write_all(fd, line);
     }
 }
@@ -394,7 +394,13 @@ static void send_hand_snapshot(int fd, const Card* hand, int hand_size) {
  * @return -1 Line looks like a back request but for another name or invalid.
  */
 static int is_back_request_for_name(const char* line, const char* expected_name) {
-    if (!line || !expected_name || expected_name[0] == '\0') return 0;
+    if (!line) return 0;
+
+    // New compact format: "C45B\n" (name is implied by the connection).
+    if (is_token(line, "C45B")) return 1;
+
+    // Legacy format: "C45<name>back\n".
+    if (!expected_name || expected_name[0] == '\0') return 0;
     if (strncmp(line, "C45", 3) != 0) return 0;
 
     const char* s = line + 3;
@@ -479,9 +485,9 @@ static int drain_nonactive_player_input(Lobby* L,
                 memmove(inbuf, inbuf + line_len, *inlen - line_len);
                 *inlen -= line_len;
 
-                if (is_token(line, "C45PONG")) continue;
-                if (is_token(line, "C45PING")) {
-                    (void)write_all(other_fd, "C45PONG\n");
+                if (is_token(line, "C45PO")) continue;
+                if (is_token(line, "C45PI")) {
+                    (void)write_all(other_fd, "C45PO\n");
                     continue;
                 }
                 if (is_token(line, "C45YES")) continue;
@@ -539,7 +545,7 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
     pthread_mutex_unlock(&L->mtx);
 
     char msg[128];
-    snprintf(msg, sizeof(msg), "C45OPPDOWN %s %d\n", missing_name, RECONNECT_TIMEOUT_SEC);
+    snprintf(msg, sizeof(msg), "C45OD %s %d\n", missing_name, RECONNECT_TIMEOUT_SEC);
     if (other_fd >= 0) write_all(other_fd, msg);
 
     time_t deadline = time(NULL) + RECONNECT_TIMEOUT_SEC;
@@ -566,7 +572,7 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
 
             send_hand_snapshot(missing_fd, hand, hand_size);
 
-            snprintf(msg, sizeof(msg), "C45OPPBACK %s\n", missing_name);
+            snprintf(msg, sizeof(msg), "C45OB %s\n", missing_name);
             if (other_fd >= 0) write_all(other_fd, msg);
             return 0;
         }
@@ -575,7 +581,7 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
         if (other_fd < 0) return -1;
 
         if (now - last_ping >= PING_INTERVAL_SEC) {
-            if (write_all(other_fd, "C45PING\n") < 0) return -1;
+            if (write_all(other_fd, "C45PI\n") < 0) return -1;
             last_ping = now;
         }
 
@@ -585,10 +591,10 @@ static int wait_for_reconnect(Lobby* L, int missing_idx, int other_idx) {
             // no data
         } else if (r <= 0) {
             return -1;
-        } else if (is_token(buf, "C45PONG")) {
+        } else if (is_token(buf, "C45PO")) {
             last_pong = now;
-        } else if (is_token(buf, "C45PING")) {
-            (void)write_all(other_fd, "C45PONG\n");
+        } else if (is_token(buf, "C45PI")) {
+            (void)write_all(other_fd, "C45PO\n");
             last_pong = now;
         } else if (is_back_request_for_name(buf, other_name) == 1) {
             active_name_mark_back(other_name, other_fd);
@@ -635,9 +641,9 @@ static void* lobby_game_thread(void* arg) {
     }
     char c1[3], c2[3], line[128];
     card_to_str(A->hand[0], c1); card_to_str(A->hand[1], c2);
-    snprintf(line, sizeof(line), "C45DEAL %s %s\n", c1, c2); write_all(A->fd, line);
+    snprintf(line, sizeof(line), "C45D %s %s\n", c1, c2); write_all(A->fd, line);
     card_to_str(B->hand[0], c1); card_to_str(B->hand[1], c2);
-    snprintf(line, sizeof(line), "C45DEAL %s %s\n", c1, c2); write_all(B->fd, line);
+    snprintf(line, sizeof(line), "C45D %s %s\n", c1, c2); write_all(B->fd, line);
     pthread_mutex_unlock(&L->mtx);
 
     int turn = 0; // player #1 starts
@@ -661,7 +667,7 @@ static void* lobby_game_thread(void* arg) {
 	        int fdB = B->fd;
         pthread_mutex_unlock(&L->mtx);
 
-        snprintf(line, sizeof(line), "C45TURN %s %d\n", turn_name, TURN_TIMEOUT_SEC);
+        snprintf(line, sizeof(line), "C45T %s %d\n", turn_name, TURN_TIMEOUT_SEC);
         if (fdA >= 0 && write_all(fdA, line) < 0) goto pause_a;
         if (fdB >= 0 && write_all(fdB, line) < 0) goto pause_b;
 
@@ -705,7 +711,7 @@ static void* lobby_game_thread(void* arg) {
 		            // Keep the current player alive with PING/PONG.
 		            // The non-active player's socket is handled non-blocking above (PING/PONG + violations).
 		            if (now - last_ping >= PING_INTERVAL_SEC) {
-	                if (write_all(pfd, "C45PING\n") < 0) goto pause_turn;
+	                if (write_all(pfd, "C45PI\n") < 0) goto pause_turn;
 	                last_ping = now;
 	            }
 
@@ -715,48 +721,48 @@ static void* lobby_game_thread(void* arg) {
 	                // no input this second
 		            } else if (r <= 0) {
 		                goto pause_turn;
-		            } else if (is_token(buf, "C45PONG")) {
-		                last_pong = now;
-		                continue;
-		            } else if (is_token(buf, "C45PING")) {
-		                (void)write_all(pfd, "C45PONG\n");
-		                last_pong = now;
-		                continue;
-		            } else if (is_token(buf, "C45YES")) {
-		                // Can arrive late from the lobby waiting phase; ignore.
-		                continue;
+			            } else if (is_token(buf, "C45PO")) {
+			                last_pong = now;
+			                continue;
+			            } else if (is_token(buf, "C45PI")) {
+			                (void)write_all(pfd, "C45PO\n");
+			                last_pong = now;
+			                continue;
+			            } else if (is_token(buf, "C45YES")) {
+			                // Can arrive late from the lobby waiting phase; ignore.
+			                continue;
 		            } else if (is_back_request_for_name(buf, L->players[turn].name) == 1) {
 	                active_name_mark_back(L->players[turn].name, pfd);
 	                forced_winner_idx = 1 - turn;
 	                goto end_game;
-	            } else if (strncmp(buf, "C45HIT", 6) == 0) {
-            pthread_mutex_lock(&L->mtx);
-            Card nc = deck_draw(&L->deck);
-            Player* P = &L->players[turn];
-            P->hand[P->hand_size++] = nc;
+		            } else if (is_token(buf, "C45H")) {
+	            pthread_mutex_lock(&L->mtx);
+	            Card nc = deck_draw(&L->deck);
+	            Player* P = &L->players[turn];
+	            P->hand[P->hand_size++] = nc;
             char cs[3]; card_to_str(nc, cs);
             pthread_mutex_unlock(&L->mtx);
-            char msg[32]; snprintf(msg, sizeof(msg), "C45CARD %s\n", cs);
-            if (write_all(pfd, msg) < 0) goto pause_turn;
+	            char msg[32]; snprintf(msg, sizeof(msg), "C45C %s\n", cs);
+	            if (write_all(pfd, msg) < 0) goto pause_turn;
 	            // check for overhand
 	            pthread_mutex_lock(&L->mtx);
 	            int v = hand_value(P->hand, P->hand_size);
 		            if (v > 21) {
 		                P->busted = 1;
 		                pthread_mutex_unlock(&L->mtx);
-		                snprintf(line, sizeof(line), "C45BUST %s %d\n", P->name, v);
-		                // Send bust only to the player who busted (do not reveal to opponent mid-game).
-		                if (write_all(pfd, line) < 0) goto pause_turn;
+			                snprintf(line, sizeof(line), "C45B %s %d\n", P->name, v);
+			                // Send bust only to the player who busted (do not reveal to opponent mid-game).
+			                if (write_all(pfd, line) < 0) goto pause_turn;
 		            } else {
 		                pthread_mutex_unlock(&L->mtx);
 		            }
 	            // Step-by-step: after HIT (bust or not) the turn goes to the other player.
 	            turn = 1 - turn;
 	            break;
-	            } else if (strncmp(buf, "C45STAND", 8) == 0) {
-	                pthread_mutex_lock(&L->mtx);
-	                L->players[turn].stood = 1;
-                pthread_mutex_unlock(&L->mtx);
+		            } else if (is_token(buf, "C45S")) {
+		                pthread_mutex_lock(&L->mtx);
+		                L->players[turn].stood = 1;
+	                pthread_mutex_unlock(&L->mtx);
                 turn = 1 - turn;
                 break;
 	            } else {
@@ -776,10 +782,10 @@ static void* lobby_game_thread(void* arg) {
                 pthread_mutex_lock(&L->mtx);
                 L->players[turn].stood = 1;
                 pthread_mutex_unlock(&L->mtx);
-                if (pfd >= 0) write_all(pfd, "C45TIMEOUT\n");
-                turn = 1 - turn;
-                break;
-            }
+	                if (pfd >= 0) write_all(pfd, "C45TO\n");
+	                turn = 1 - turn;
+	                break;
+	            }
         }
     }
 
@@ -828,10 +834,10 @@ end_game:
     pthread_mutex_unlock(&L->mtx);
 
     char res[256];
-    int res_len = snprintf(res, sizeof(res), "C45RESULT %s %d %s %d WINNER %s\n",
+    int res_len = snprintf(res, sizeof(res), "C45R %s %d %s %d %s\n",
                            A->name, va, B->name, vb, winner_name);
     if (res_len < 0 || (size_t)res_len >= sizeof(res)) {
-        snprintf(res, sizeof(res), "C45RESULT %s %d %s %d WINNER %s\n",
+        snprintf(res, sizeof(res), "C45R %s %d %s %d %s\n",
                  "?", va, "?", vb, "PUSH");
     }
     if (A->fd >= 0) write_all(A->fd, res);

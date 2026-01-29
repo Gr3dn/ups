@@ -15,7 +15,7 @@
  * Table of contents:
  *   - Signal handling: on_sigint()
  *   - Active name registry: active_name_*()
- *   - Parsing helpers: parse_name_only(), parse_name_lobby(), is_back_request_for()
+ *   - Parsing helpers: parse_name_only()
  *   - Client thread state machine: client_thread()
  *   - Server loop: run_server()
  */
@@ -36,6 +36,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -44,20 +45,74 @@
 
 #define ACTIVE_MAX 256
 #define CLIENT_FD_MAX 1024
-#define WAITING_INTERVAL_SEC 10
 // Reserving names among all active connections (until disconnect)
 static pthread_mutex_t g_names_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char g_active_names[ACTIVE_MAX][MAX_NAME_LEN];
 static int  g_active_fds[ACTIVE_MAX];
 static int  g_active_back_req[ACTIVE_MAX];
-static unsigned long long g_active_tokens[ACTIVE_MAX];
-static unsigned long long g_token_seq = 1;
+static uint64_t g_active_tokens[ACTIVE_MAX];
+static uint64_t g_token_seq = 1;
 static int  g_active_cnt = 0;
 
 // Connected client sockets (including those who haven't completed handshake yet).
 static pthread_mutex_t g_clients_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int  g_client_fds[CLIENT_FD_MAX];
 static int  g_client_cnt = 0;
+
+/**
+ * Fetch the Linux socket cookie for a file descriptor.
+ *
+ * The cookie is a unique (per-socket) 64-bit identifier that changes when an fd number
+ * is reused for another socket. Some environments can close sockets asynchronously
+ * (outside this thread), and the OS may reuse fd numbers quickly; the cookie lets us
+ * detect such reuse and avoid closing the wrong socket.
+ *
+ * @param fd Socket file descriptor.
+ * @return Socket cookie value, or 0 if unavailable.
+ */
+static uint64_t socket_cookie(int fd) {
+#ifdef SO_COOKIE
+    uint64_t cookie = 0;
+    socklen_t len = sizeof(cookie);
+    if (getsockopt(fd, SOL_SOCKET, SO_COOKIE, &cookie, &len) == 0) return cookie;
+#endif
+    return 0;
+}
+
+/**
+ * Close a tracked/original accept() fd safely (only if it still refers to the same socket).
+ *
+ * A socket may be closed asynchronously, and the OS may reuse that fd number
+ * for a new connection. We must not close the reused fd.
+ *
+ * @param fd      Tracked file descriptor (original accept()).
+ * @param cookie  Socket cookie captured at accept time.
+ */
+static void close_tracked_fd_if_same(int fd, uint64_t cookie) {
+    if (fd < 0) return;
+#ifdef SO_COOKIE
+    if (cookie == 0) return; // cannot safely verify fd reuse
+    uint64_t cur = socket_cookie(fd);
+    if (cur != cookie) return;
+#else
+    (void)cookie;
+#endif
+    (void)close(fd);
+}
+
+/**
+ * Thread arguments for a client connection.
+ *
+ * We keep two fds for the same socket:
+ *   - app_fd: used by the server logic.
+ *   - track_fd: the original accept() fd kept only for safe cleanup in environments
+ *     where the original fd may be closed independently from app_fd.
+ */
+typedef struct ClientThreadArgs {
+    int app_fd;
+    int track_fd;
+    uint64_t cookie;
+} ClientThreadArgs;
 
 /**
  * Register a connected client socket file descriptor.
@@ -121,8 +176,8 @@ static void server_notify_and_disconnect_all(const char* reason) {
     pthread_mutex_unlock(&g_clients_mtx);
 
     char msg[128];
-    if (reason && *reason) snprintf(msg, sizeof(msg), "C45SERVER_DOWN %s\n", reason);
-    else snprintf(msg, sizeof(msg), "C45SERVER_DOWN\n");
+    if (reason && *reason) snprintf(msg, sizeof(msg), "C45DOWN %s\n", reason);
+    else snprintf(msg, sizeof(msg), "C45DOWN\n");
     size_t len = strlen(msg);
 
     for (int i = 0; i < cnt; ++i) {
@@ -198,7 +253,7 @@ static int is_bind_ip_available(const char* bind_ip) {
  * by requiring the token to be followed by end-of-string or whitespace.
  *
  * @param line Full received line (NUL-terminated).
- * @param tok  Token string to match (e.g. "C45PING").
+ * @param tok  Token string to match (e.g. "C45PI").
  * @return 1 if @p line begins with @p tok and is followed by end/whitespace; 0 otherwise.
  */
 static int is_token(const char* line, const char* tok) {
@@ -292,7 +347,7 @@ static int active_name_find(const char* n) {
  * @param fd Connected socket file descriptor.
  * @return New token value, or 0 if the name is not found.
  */
-static unsigned long long active_name_set_fd(const char* n, int fd) {
+static uint64_t active_name_set_fd(const char* n, int fd) {
     int i = active_name_find(n);
     if (i >= 0) {
         g_active_fds[i] = fd;
@@ -308,7 +363,7 @@ static unsigned long long active_name_set_fd(const char* n, int fd) {
  * @param n     Player name.
  * @param token Token value previously returned by active_name_set_fd().
  */
-static void active_name_remove_if_token(const char* n, unsigned long long token) {
+static void active_name_remove_if_token(const char* n, uint64_t token) {
     int i = active_name_find(n);
     if (i < 0) return;
     if (g_active_tokens[i] != token) return;
@@ -467,68 +522,6 @@ static int lobby_remove_player_by_name_if_fd(const char* name, int expected_fd) 
 }
 
 /**
- * Parse a lobby selection line in the legacy format: "C45<name><lobby>\n".
- *
- * Note: for backward compatibility this parser treats ONLY the last digit as the lobby number.
- * This means lobbies above 9 are not representable in this legacy command.
- *
- * @param line        Full received line.
- * @param out_name    Output buffer for the extracted player name.
- * @param out_name_sz Size of @p out_name in bytes.
- * @param out_lobby   Output: parsed lobby number (1-based).
- *
- * @return 0 on success; negative value on parse/validation error.
- */
-static int parse_name_lobby(const char* line, char* out_name, int out_name_sz, int* out_lobby) {
-    if (!is_c45_prefix(line)) return -1;
-
-    /* cut off “C45” and trailing \r\n and spaces */
-    const char* s = line + 3;
-    while (*s == ' ' || *s == '\t') s++;
-
-    char tmp[READ_BUF];
-    strncpy(tmp, s, sizeof(tmp)-1);
-    tmp[sizeof(tmp)-1] = '\0';
-
-    // Trim trailing CR/LF and whitespace.
-    for (int i = (int)strlen(tmp)-1; i >= 0 &&
-             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
-        tmp[i] = '\0';
-    }
-    if (tmp[0] == '\0') return -2;
-
-    /* Legacy format: use ONLY the last digit as the lobby number. */
-    int len = (int)strlen(tmp);
-    int pos = len - 1;
-    if (pos < 0) return -3;
-
-    // The last non-whitespace character must be a digit.
-    if (tmp[pos] < '0' || tmp[pos] > '9') return -4;  // no digit at the end
-
-    int lobby = tmp[pos] - '0';
-    tmp[pos] = '\0';          // cut the lobby digit
-    pos--;
-
-    if (lobby < 1 || lobby > g_lobby_count) return -5;
-
-    /* Now tmp contains only the name (may still have trailing whitespace). */
-    while (pos >= 0 && (tmp[pos] == ' ' || tmp[pos] == '\t')) {
-        tmp[pos] = '\0';
-        pos--;
-    }
-    if (pos < 0) return -6;
-
-    for (int i = 0; tmp[i]; ++i) {
-        if (isspace((unsigned char)tmp[i])) return -8; // protocol uses whitespace delimiters
-    }
-    if ((int)strlen(tmp) >= out_name_sz) return -7;
-
-    strcpy(out_name, tmp);
-    *out_lobby = lobby;
-    return 0;
-}
-
-/**
  * Parse a client name line in the format: "C45<name>\n".
  *
  * @param line        Full received line.
@@ -561,50 +554,6 @@ static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
 }
 
 /**
- * Check whether a line is a "back to lobby" request for a specific name.
- *
- * Expected format:
- *   "C45<name>back\n"
- *
- * @param line          Full received line.
- * @param expected_name Player name to match.
- *
- * @return  1 Line matches a valid back request for @p expected_name.
- * @return  0 Line is not a back request.
- * @return -1 Line looks like a back request but for another name or invalid.
- */
-static int is_back_request_for(const char* line, const char* expected_name) {
-    if (!is_c45_prefix(line)) return 0;
-    if (!expected_name || expected_name[0] == '\0') return 0;
-
-    const char* s = line + 3;
-    while (*s == ' ' || *s == '\t') s++;
-
-    char tmp[READ_BUF];
-    strncpy(tmp, s, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
-
-    for (int i = (int)strlen(tmp) - 1; i >= 0 &&
-             (tmp[i] == '\r' || tmp[i] == '\n' || tmp[i] == ' ' || tmp[i] == '\t'); --i) {
-        tmp[i] = '\0';
-    }
-
-    const char* suffix = "back";
-    size_t len = strlen(tmp);
-    size_t slen = strlen(suffix);
-    if (len <= slen) return 0;
-    if (strcmp(tmp + (len - slen), suffix) != 0) return 0;
-
-    tmp[len - slen] = '\0';
-    for (int i = (int)strlen(tmp) - 1; i >= 0 && (tmp[i] == ' ' || tmp[i] == '\t'); --i) {
-        tmp[i] = '\0';
-    }
-    if (tmp[0] == '\0') return -1;
-
-    return (strncmp(tmp, expected_name, MAX_NAME_LEN) == 0) ? 1 : -1;
-}
-
-/**
  * Busy-wait until a lobby changes its running state.
  *
  * @param lobby_index    Zero-based lobby index.
@@ -631,7 +580,12 @@ static void wait_lobby_running_change(int lobby_index, int target_running) {
  * @return NULL.
  */
 static void* client_thread(void* arg) {
-    int cfd = (int)(intptr_t)arg;
+    ClientThreadArgs* a = (ClientThreadArgs*)arg;
+    int cfd = a ? a->app_fd : -1;
+    int track_fd = a ? a->track_fd : -1;
+    uint64_t track_cookie = a ? a->cookie : 0;
+    free(a);
+
     printf("[NET] Client start (fd=%d)\n", cfd);
 
     client_fd_add(cfd);
@@ -644,7 +598,7 @@ static void* client_thread(void* arg) {
     char line[READ_BUF];
     char name[MAX_NAME_LEN] = {0};
     int lobby_num = -1;
-    unsigned long long my_token = 0;
+    uint64_t my_token = 0;
 
     /* --- Handshake --- */
     int n;
@@ -654,6 +608,7 @@ static void* client_thread(void* arg) {
             printf("[NET] Client fd=%d closed during handshake\n", cfd);
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
         if (!is_c45_prefix(line)) {
@@ -661,27 +616,29 @@ static void* client_thread(void* arg) {
             write_all(cfd, "C45WRONG\n");
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
 
         // Allow keep-alive before a name is entered (client may keep the TCP connection open
         // while waiting on the "enter nickname" screen).
-        if (is_token(line, "C45PING")) {
-            (void)write_all(cfd, "C45PONG\n");
+        if (is_token(line, "C45PI")) {
+            (void)write_all(cfd, "C45PO\n");
             continue;
         }
-        if (is_token(line, "C45PONG")) continue;
+        if (is_token(line, "C45PO")) continue;
 
         break; // real handshake line
     }
 
-    // Reconnect path: first line is "C45RECONNECT <name> <lobby>\n"
-    if (strncmp(line, "C45RECONNECT ", 13) == 0) {
-        if (sscanf(line, "C45RECONNECT %63s %d", name, &lobby_num) != 2 ||
+    // Reconnect path: first line is "C45REC <name> <lobby>\n"
+    if (strncmp(line, "C45REC ", 7) == 0) {
+        if (sscanf(line, "C45REC %63s %d", name, &lobby_num) != 2 ||
             lobby_num < 0 || lobby_num > g_lobby_count) {
             write_all(cfd, "C45WRONG RECONNECT\n");
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
 
@@ -728,13 +685,14 @@ static void* client_thread(void* arg) {
                         write_all(cfd, "C45WRONG RECONNECT\n");
                         client_fd_remove(cfd);
                         close(cfd);
+                        close_tracked_fd_if_same(track_fd, track_cookie);
                         return NULL;
                     }
                 }
                 my_token = active_name_set_fd(name, cfd);
                 pthread_mutex_unlock(&g_names_mtx);
 
-                write_all(cfd, "C45RECONNECT_OK\n");
+                write_all(cfd, "C45REC_OK\n");
                 printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
                 goto game_wait;
             }
@@ -750,13 +708,14 @@ static void* client_thread(void* arg) {
                             write_all(cfd, "C45WRONG RECONNECT\n");
                             client_fd_remove(cfd);
                             close(cfd);
+                            close_tracked_fd_if_same(track_fd, track_cookie);
                             return NULL;
                         }
                     }
                     my_token = active_name_set_fd(name, cfd);
                     pthread_mutex_unlock(&g_names_mtx);
 
-                    write_all(cfd, "C45RECONNECT_OK\n");
+                    write_all(cfd, "C45REC_OK\n");
                     printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
                     goto game_wait;
                 }
@@ -776,13 +735,14 @@ static void* client_thread(void* arg) {
                     write_all(cfd, "C45WRONG RECONNECT\n");
                     client_fd_remove(cfd);
                     close(cfd);
+                    close_tracked_fd_if_same(track_fd, track_cookie);
                     return NULL;
                 }
             }
             my_token = active_name_set_fd(name, cfd);
             pthread_mutex_unlock(&g_names_mtx);
 
-            write_all(cfd, "C45RECONNECT_OK\n");
+            write_all(cfd, "C45REC_OK\n");
             printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
             start_game_if_ready(li);
             goto wait_for_game_start;
@@ -800,17 +760,18 @@ static void* client_thread(void* arg) {
                     pthread_mutex_lock(&g_names_mtx);
                     if (!active_name_has(name)) {
                         if (active_name_add(name) != 0) {
-                            pthread_mutex_unlock(&g_names_mtx);
-                            write_all(cfd, "C45WRONG RECONNECT\n");
-                            client_fd_remove(cfd);
-                            close(cfd);
-                            return NULL;
-                        }
+                        pthread_mutex_unlock(&g_names_mtx);
+                        write_all(cfd, "C45WRONG RECONNECT\n");
+                        client_fd_remove(cfd);
+                        close(cfd);
+                        close_tracked_fd_if_same(track_fd, track_cookie);
+                        return NULL;
                     }
-                    my_token = active_name_set_fd(name, cfd);
-                    pthread_mutex_unlock(&g_names_mtx);
+                }
+                my_token = active_name_set_fd(name, cfd);
+                pthread_mutex_unlock(&g_names_mtx);
 
-                    write_all(cfd, "C45RECONNECT_OK\n");
+                    write_all(cfd, "C45REC_OK\n");
                     printf("[NET] Reconnected '%s' to lobby #%d (fd=%d)\n", name, lobby_num, cfd);
                     goto game_wait;
                 }
@@ -827,17 +788,18 @@ static void* client_thread(void* arg) {
                     pthread_mutex_lock(&g_names_mtx);
                     if (!active_name_has(name)) {
                         if (active_name_add(name) != 0) {
-                            pthread_mutex_unlock(&g_names_mtx);
-                            write_all(cfd, "C45WRONG RECONNECT\n");
-                            client_fd_remove(cfd);
-                            close(cfd);
-                            return NULL;
-                        }
+                        pthread_mutex_unlock(&g_names_mtx);
+                        write_all(cfd, "C45WRONG RECONNECT\n");
+                        client_fd_remove(cfd);
+                        close(cfd);
+                        close_tracked_fd_if_same(track_fd, track_cookie);
+                        return NULL;
                     }
-                    my_token = active_name_set_fd(name, cfd);
-                    pthread_mutex_unlock(&g_names_mtx);
+                }
+                my_token = active_name_set_fd(name, cfd);
+                pthread_mutex_unlock(&g_names_mtx);
 
-                    write_all(cfd, "C45RECONNECT_OK\n");
+                    write_all(cfd, "C45REC_OK\n");
                     printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
                     start_game_if_ready(i);
                     goto wait_for_game_start;
@@ -855,17 +817,18 @@ static void* client_thread(void* arg) {
                     pthread_mutex_lock(&g_names_mtx);
                     if (!active_name_has(name)) {
                         if (active_name_add(name) != 0) {
-                            pthread_mutex_unlock(&g_names_mtx);
-                            write_all(cfd, "C45WRONG RECONNECT\n");
-                            client_fd_remove(cfd);
-                            close(cfd);
-                            return NULL;
-                        }
+                        pthread_mutex_unlock(&g_names_mtx);
+                        write_all(cfd, "C45WRONG RECONNECT\n");
+                        client_fd_remove(cfd);
+                        close(cfd);
+                        close_tracked_fd_if_same(track_fd, track_cookie);
+                        return NULL;
                     }
-                    my_token = active_name_set_fd(name, cfd);
-                    pthread_mutex_unlock(&g_names_mtx);
+                }
+                my_token = active_name_set_fd(name, cfd);
+                pthread_mutex_unlock(&g_names_mtx);
 
-                    write_all(cfd, "C45RECONNECT_OK\n");
+                    write_all(cfd, "C45REC_OK\n");
                     printf("[NET] Reconnected '%s' to lobby #%d (waiting, fd=%d)\n", name, lobby_num, cfd);
                     start_game_if_ready(li);
                     goto wait_for_game_start;
@@ -878,6 +841,7 @@ static void* client_thread(void* arg) {
         if (lobby_name_exists(name)) {
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
 
@@ -888,6 +852,7 @@ static void* client_thread(void* arg) {
                 write_all(cfd, "C45WRONG\n");
                 client_fd_remove(cfd);
                 close(cfd);
+                close_tracked_fd_if_same(track_fd, track_cookie);
                 return NULL;
             }
         }
@@ -900,6 +865,7 @@ static void* client_thread(void* arg) {
             pthread_mutex_unlock(&g_names_mtx);
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
         if (send_lobbies_snapshot(cfd) < 0) {
@@ -909,6 +875,7 @@ static void* client_thread(void* arg) {
             pthread_mutex_unlock(&g_names_mtx);
             client_fd_remove(cfd);
             close(cfd);
+            close_tracked_fd_if_same(track_fd, track_cookie);
             return NULL;
         }
 
@@ -929,6 +896,7 @@ static void* client_thread(void* arg) {
         write_all(cfd, "C45WRONG NAME_TAKEN\n");
         client_fd_remove(cfd);
         close(cfd);
+        close_tracked_fd_if_same(track_fd, track_cookie);
         return NULL;
     }
 
@@ -944,6 +912,7 @@ static void* client_thread(void* arg) {
         write_all(cfd, "C45WRONG NAME_TAKEN\n");
         client_fd_remove(cfd);
         close(cfd);
+        close_tracked_fd_if_same(track_fd, track_cookie);
         return NULL;
     }
 
@@ -954,6 +923,7 @@ static void* client_thread(void* arg) {
         pthread_mutex_unlock(&g_names_mtx);
         client_fd_remove(cfd);
         close(cfd);
+        close_tracked_fd_if_same(track_fd, track_cookie);
         return NULL;
     }
 
@@ -965,12 +935,13 @@ static void* client_thread(void* arg) {
         pthread_mutex_unlock(&g_names_mtx);
         client_fd_remove(cfd);
         close(cfd);
+        close_tracked_fd_if_same(track_fd, track_cookie);
         return NULL;
     }
 
 lobby_select:
     for (;;) {
-        /* --- waiting for player selection: C45<name><lobby>\n --- */
+        /* --- waiting for player selection: C45J <lobby>\n --- */
         lobby_num = -1;
         for (;;) {
             n = read_line(cfd, line, sizeof(line));
@@ -981,33 +952,26 @@ lobby_select:
             // printf("[PROTO] Take: \"%s\" (fd=%d)\n", line, cfd);
 
             // Client keep-alive (bidirectional): reply and continue waiting for real commands.
-            if (is_token(line, "C45PING")) {
-                (void)write_all(cfd, "C45PONG\n");
+            if (is_token(line, "C45PI")) {
+                (void)write_all(cfd, "C45PO\n");
                 continue;
             }
-            if (is_token(line, "C45PONG")) continue;
-            
-            int br = is_back_request_for(line, name);
-            if (br == 1) {
-                // Allow requesting the snapshot at any time outside the game loop
+            if (is_token(line, "C45PO")) continue;
+
+            // Request snapshot refresh outside the game loop.
+            if (is_token(line, "C45B")) {
                 if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
                 continue;
-            } else if (br < 0) {
-                write_all(cfd, "C45WRONG\n");
-                goto disconnect; // invalid back request
             }
 
-            char join_name[MAX_NAME_LEN];
-            if (parse_name_lobby(line, join_name, sizeof(join_name), &lobby_num) != 0) {
-                printf("[PROTO] Wrong format of choise -> C45WRONG (fd=%d)\n", cfd);
+            // Join lobby.
+            if (sscanf(line, "C45J %d", &lobby_num) != 1 ||
+                lobby_num < 1 || lobby_num > g_lobby_count) {
+                printf("[PROTO] Wrong lobby choice -> C45WRONG (fd=%d)\n", cfd);
                 write_all(cfd, "C45WRONG\n");
-                goto disconnect;
+                continue; // stay connected and allow choosing another lobby
             }
-            if (strncmp(join_name, name, MAX_NAME_LEN) != 0) {
-                printf("[PROTO] Join name mismatch '%s' != '%s' (fd=%d)\n", join_name, name, cfd);
-                write_all(cfd, "C45WRONG\n");
-                goto disconnect;
-            }
+
             break;
         }
 
@@ -1035,28 +999,17 @@ lobby_select:
 wait_for_game_start:
 	        printf("[WAIT] '%s' Waiting for player in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
 
-	        // wait until the game actually starts (or client cancels/disconnects)
-	        {
-	        time_t last_waiting_sent = 0;
-	        for (;;) {
-	            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
-	            int running = g_lobbies[lobby_num - 1].is_running;
-	            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
-	            if (running) break;
+		        // wait until the game actually starts (or client cancels/disconnects)
+		        {
+		        for (;;) {
+		            pthread_mutex_lock(&g_lobbies[lobby_num - 1].mtx);
+		            int running = g_lobbies[lobby_num - 1].is_running;
+		            pthread_mutex_unlock(&g_lobbies[lobby_num - 1].mtx);
+		            if (running) break;
 
-	            time_t now = time(NULL);
-	            if (now - last_waiting_sent >= WAITING_INTERVAL_SEC) {
-                    if (write_all(cfd, "C45WAITING\n") < 0) {
-                        printf("[WAIT] write C45WAITING failed (fd=%d)\n", cfd);
-                        lobby_remove_player_by_name_if_fd(name, cfd);
-                        goto disconnect;
-                    }
-	                last_waiting_sent = now;
-	            }
-
-	            struct pollfd pfd = { .fd = cfd, .events = POLLIN | POLLHUP | POLLERR };
-	            int pr = poll(&pfd, 1, 1000);
-	            if (pr == 0) continue;
+		            struct pollfd pfd = { .fd = cfd, .events = POLLIN | POLLHUP | POLLERR };
+		            int pr = poll(&pfd, 1, 1000);
+		            if (pr == 0) continue;
                     if (pr < 0) {
                         if (errno == EINTR) continue;
                         printf("[WAIT] poll failed while waiting (fd=%d)\n", cfd);
@@ -1100,24 +1053,22 @@ wait_for_game_start:
                         goto disconnect;
                     }
 
-		            if (is_token(line, "C45PING")) {
-		                (void)write_all(cfd, "C45PONG\n");
-		                continue;
-		            }
-		            if (is_token(line, "C45PONG")) continue;
-		            if (strncmp(line, "C45YES", 6) == 0) continue;
+			            if (is_token(line, "C45PI")) {
+			                (void)write_all(cfd, "C45PO\n");
+			                continue;
+			            }
+			            if (is_token(line, "C45PO")) continue;
 
-		            int br = is_back_request_for(line, name);
-                    if (br == 1) {
-                        // Cancel waiting: remove from lobby and return to lobby selection
-                        lobby_remove_player_by_name_if_fd(name, cfd);
-                        if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
-                        goto next_round;
-                    }
-                    // Any other line while waiting is a protocol error.
-                    write_all(cfd, "C45WRONG\n");
-                    lobby_remove_player_by_name_if_fd(name, cfd);
-                    goto disconnect;
+			            if (is_token(line, "C45B")) {
+			                        // Cancel waiting: remove from lobby and return to lobby selection
+			                        lobby_remove_player_by_name_if_fd(name, cfd);
+			                        if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
+			                        goto next_round;
+			            }
+	                    // Any other line while waiting is a protocol error.
+			                    write_all(cfd, "C45WRONG\n");
+			                    lobby_remove_player_by_name_if_fd(name, cfd);
+			                    goto disconnect;
 	        }
 	        }
         printf("[GAME] '%s' Game started in lobby #%d (fd=%d)\n", name, lobby_num, cfd);
@@ -1126,29 +1077,29 @@ game_wait:
         // Ensure the player has been removed from the lobby by the game thread
         while (lobby_name_exists(name)) usleep(10000);
 
-        printf("[GAME] '%s' Game finished, waiting for '%sback' (fd=%d)\n", name, name, cfd);
+		        printf("[GAME] '%s' Game finished, waiting for back request (fd=%d)\n", name, cfd);
         if (active_name_take_back(name, cfd)) {
             if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
             goto next_round;
         }
-	        for (;;) {
-	            n = read_line(cfd, line, sizeof(line));
-	            if (n <= 0) goto disconnect;
-	            if (is_token(line, "C45PING")) {
-	                (void)write_all(cfd, "C45PONG\n");
-	                continue;
-	            }
-	            if (is_token(line, "C45PONG")) continue;
-	            if (strncmp(line, "C45YES", 6) == 0) continue;
-                // Late/stale game commands can arrive after the match ends (race between UI clicks and
-                // server finishing the game). Ignore them and keep waiting for "<name>back".
-                if (is_token(line, "C45HIT") || is_token(line, "C45STAND")) continue;
-	            int br = is_back_request_for(line, name);
-	            if (br == 1) break;
-            // Any other line after game end is a protocol error.
-            write_all(cfd, "C45WRONG\n");
-            goto disconnect;
-        }
+		        for (;;) {
+		            n = read_line(cfd, line, sizeof(line));
+		            if (n <= 0) goto disconnect;
+		            if (is_token(line, "C45PI")) {
+		                (void)write_all(cfd, "C45PO\n");
+		                continue;
+		            }
+		            if (is_token(line, "C45PO")) continue;
+
+	                // Late/stale game commands can arrive after the match ends (race between UI clicks and
+	                // server finishing the game). Ignore them and keep waiting for "back".
+	                if (is_token(line, "C45H") || is_token(line, "C45S")) continue;
+		            if (is_token(line, "C45B")) break;
+
+	            // Any other line after game end is a protocol error.
+	            write_all(cfd, "C45WRONG\n");
+	            goto disconnect;
+	        }
 
         if (send_lobbies_snapshot(cfd) < 0) goto disconnect;
 
@@ -1162,6 +1113,7 @@ disconnect:
     pthread_mutex_unlock(&g_names_mtx);
     client_fd_remove(cfd);
     close(cfd);
+    close_tracked_fd_if_same(track_fd, track_cookie);
     return NULL;
 }
 
@@ -1249,8 +1201,8 @@ int run_server(const char* bind_ip, int port) {
 
         struct sockaddr_in cli;
         socklen_t clen = sizeof(cli);
-        int cfd = accept(srv, (struct sockaddr*)&cli, &clen);
-        if (cfd < 0) {
+        int track_fd = accept(srv, (struct sockaddr*)&cli, &clen);
+        if (track_fd < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             ret = 1;
@@ -1258,11 +1210,30 @@ int run_server(const char* bind_ip, int port) {
             break;
         }
 
-        printf("[NET] Connecting %s:%d (fd=%d)\n",
-               inet_ntoa(cli.sin_addr), ntohs(cli.sin_port), cfd);
+        uint64_t cookie = socket_cookie(track_fd);
+        int cfd = dup(track_fd);
+        if (cfd < 0) {
+            perror("dup");
+            close(track_fd);
+            continue;
+        }
+        if (cookie == 0) cookie = socket_cookie(cfd);
+
+        printf("[NET] Connecting %s:%d (fd=%d track=%d)\n",
+               inet_ntoa(cli.sin_addr), ntohs(cli.sin_port), cfd, track_fd);
 
         pthread_t th;
-        pthread_create(&th, NULL, client_thread, (void*)(intptr_t)cfd);
+        ClientThreadArgs* args = (ClientThreadArgs*)malloc(sizeof(*args));
+        if (!args) {
+            close(cfd);
+            close_tracked_fd_if_same(track_fd, cookie);
+            continue;
+        }
+        args->app_fd = cfd;
+        args->track_fd = track_fd;
+        args->cookie = cookie;
+
+        pthread_create(&th, NULL, client_thread, args);
         pthread_detach(th);
     }
 

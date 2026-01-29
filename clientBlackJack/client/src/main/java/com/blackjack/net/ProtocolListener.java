@@ -39,6 +39,19 @@ public interface ProtocolListener {
      */
     default void onServerError(String msg){ }
 
+    /**
+     * Called when the client starts an automatic reconnect attempt.
+     *
+     * @param attempt     1-based attempt number.
+     * @param maxAttempts Maximum attempts in this reconnect window.
+     */
+    default void onReconnectAttempt(int attempt, int maxAttempts) { }
+
+    /**
+     * Called when the server acknowledges the reconnect request with {@code C45REC_OK}.
+     */
+    default void onReconnectSucceeded() { }
+
     /* --- Game phase --- */
     /**
      * Called when the server deals the initial two cards.
