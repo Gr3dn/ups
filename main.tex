@@ -1,0 +1,538 @@
+\documentclass[11pt,a4paper]{article}
+
+% Encoding and Czech language
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[czech]{babel}
+
+% Page layout
+\usepackage{geometry}
+\geometry{margin=2.2cm}
+\usepackage{setspace}
+\setstretch{1.05}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.25em}
+
+% Lists
+\usepackage{enumitem}
+
+% Links
+\usepackage[hidelinks]{hyperref}
+
+% Code listings
+\usepackage{xcolor}
+\usepackage{listings}
+\lstdefinelanguage{C45proto}{
+  morekeywords={C45OK,C45WRONG,C45DOWN,C45REC,C45REC_OK,C45PI,C45PO,C45J,C45B,C45H,C45S,C45L,C45D,C45T,C45C,C45TO,C45R,C45OD,C45OB},
+  sensitive=true,
+}
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{black!35},
+  keywordstyle=\color{blue!60!black}\bfseries,
+  commentstyle=\color{black!60},
+  stringstyle=\color{teal!60!black},
+  showstringspaces=false
+}
+
+\begin{document}
+
+\begin{center}
+{\LARGE\textbf{Dokumentace semestrální práce}}\\[4pt]
+\textbf{Předmět:} KIV/UPS \quad $\bullet$ \quad \textbf{Autor:} Danyil Hrechishkin \quad $\bullet$ \quad \textbf{Datum vytvoření:} 29.01.2026
+\end{center}
+
+\begin{center}
+\Large\textbf{Blackjack --- TCP klient/server (JavaFX + C)}
+\end{center}
+
+\vspace{0.5em}
+\textbf Projekt implementuje síťovou dvouhráčovou variantu hry Blackjack. Server (C, POSIX) poskytuje lobbyny a běh hry, klient (Java 17 + JavaFX) poskytuje UI, komunikaci a automatický reconnect při výpadku sítě.
+
+\section{Základní popis hry}
+
+Blackjack je karetní hra, ve které se hráč snaží dosáhnout hodnoty ruky co nejblíže k 21, bez jejího překročení.
+Tato implementace je \textbf{dvouhráčová} (bez samostatného dealera). Oba hráči dostanou dvě karty a následně se střídají v tazích.
+
+\subsection{Použitá varianta pravidel}
+\begin{itemize}[topsep=0.25em]
+  \item Používá se standardní balíček 52 karet.
+  \item Hodnoty: 2--10 dle čísla, J/Q/K = 10, eso (A) = 11 nebo 1 (dle toho, aby součet nepřesáhl 21).
+  \item Každý hráč začíná se dvěma kartami.
+  \item Ve svém tahu hráč volí:
+    \begin{itemize}[topsep=0.25em]
+      \item \textbf{HIT} --- dobere jednu kartu.
+      \item \textbf{STAND} --- ukončí dobírání.
+    \end{itemize}
+  \item Pokud hráč po HIT překročí 21, nastává \textbf{bust} a pro hráče je jeho skóre nastaveno na -1.
+  \item Hra končí, když oba hráči stojí nebo bustnou.
+  \item Výsledkem je vítěz (vyšší skóre; -1 je nejhorší) nebo \textbf{PUSH} (remíza).
+\end{itemize}
+
+\subsection{Časování a odolnost}
+Hra je navržena tak, aby byla použitelná i na nestabilní síti:
+\begin{itemize}[topsep=0.25em]
+  \item Každý tah má časový limit (na serveru \texttt{TURN\_TIMEOUT\_SEC}).
+  \item Klient i server používají keep-alive zprávy (PING/PONG), aby se výpadek odhalil v rozumném čase.
+  \item Při odpojení jednoho hráče během hry server čeká omezenou dobu na jeho návrat (\texttt{RECONNECT\_TIMEOUT\_SEC}) druhý hráč je o tom informován.
+  \item Klient při ztrátě spojení provádí automatický reconnect v definovaném okně.
+\end{itemize}
+
+\section{Přehled řešení a rozvrstvení aplikace}
+
+Projekt je rozdělen na dvě hlavní části:
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Server}: správa připojení, handshake, lobby, běh herních vláken, reconnect.
+  \item \textbf{Klient}: UI scény, síťová vrstva, parsování protokolu, automatické obnovení spojení.
+\end{itemize}
+
+\subsection{Architektonický přehled}
+Klient je rozdělen na:
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{UI vrstvu (JavaFX)} --- scény, ovládání hry, zobrazování stavu spojení,
+  \item \textbf{síťovou vrstvu} --- TCP komunikace, parsování protokolu, keep-alive a reconnect.
+\end{itemize}
+
+Server je rozdělen na:
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{síťovou vrstvu} --- accept-loop a per-client vlákna,
+  \item \textbf{logiku hry} --- lobby, herní vlákno a běh zápasu,
+  \item \textbf{I/O pomocné funkce} --- bezpečné čtení/psaní řádků a serializace snapshotů.
+\end{itemize}
+
+\subsection{Adresářová struktura}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{server/} --- serverová část v jazyce C
+    \begin{itemize}[topsep=0.25em]
+      \item \texttt{src/main.c} --- CLI entry point, načtení konfigurace, start serveru
+      \item \texttt{src/server.c} --- síťový stavový automat klienta, registry jmen, accept-loop
+      \item \texttt{src/game.c} --- lobby + herní logika, herní vlákna, reconnect ve hře
+      \item \texttt{src/protocol.c} --- nízkoúrovňové čtení/zápis řádků a serializace snapshotů lobby
+      \item \texttt{include/*.h} --- hlavičky (API a datové struktury)
+      \item \texttt{config.txt} --- runtime konfigurace (IP, port, počet lobby)
+    \end{itemize}
+  \item \texttt{clientBlackJack/client/} --- klient v Javě
+    \begin{itemize}[topsep=0.25em]
+      \item \texttt{com.blackjack.MainApp} --- JavaFX aplikace, scény, navigace a binding na síť
+      \item \texttt{com.blackjack.net.NetClient} --- TCP klient, reader thread, parser protokolu, keep-alive a reconnect
+      \item \texttt{com.blackjack.net.ProtocolListener} --- callback rozhraní pro UI
+      \item \texttt{com.blackjack.ui.GameView} --- herní okno (log, tlačítka, reconnect label)
+      \item \texttt{pom.xml} --- Maven konfigurace (Java 17, JavaFX)
+    \end{itemize}
+\end{itemize}
+
+\subsection{Použité knihovny a prostředí}
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Server:}
+    \begin{itemize}[topsep=0.25em]
+      \item Jazyk: C11
+      \item Překladač: \texttt{gcc} (nebo kompatibilní)
+      \item POSIX API: \texttt{socket}, \texttt{poll}, \texttt{pthread}, \texttt{recv/send}, \texttt{shutdown}, \texttt{getifaddrs}
+    \end{itemize}
+  \item \textbf{Klient:}
+    \begin{itemize}[topsep=0.25em]
+      \item Java: \textbf{17} (Maven \texttt{maven.compiler.release=17})
+      \item JavaFX: \textbf{17.0.15} (artefakty \texttt{javafx-controls}, \texttt{javafx-fxml})
+      \item Build: Maven + \texttt{javafx-maven-plugin}
+    \end{itemize}
+\end{itemize}
+
+\section{Protokol (specifikace pro alternativní implementaci)}
+\label{sec:protocol}
+
+\subsection{Základní pravidla formátu zpráv}
+\begin{itemize}[topsep=0.25em]
+  \item Komunikace probíhá přes \textbf{TCP}.
+  \item Všechny zprávy jsou \textbf{textové řádky} ukončené znakem \texttt{\textbackslash n}.
+  \item Oddělovačem parametrů je \textbf{whitespace} (mezera / tabulátor).
+  \item Tokeny vždy začínají prefixem \texttt{C45}.
+  \item TCP je stream: zpráva může přijít po částech nebo „slepeně“; hranice zpráv určuje pouze \texttt{\textbackslash n}.
+\end{itemize}
+
+\subsection{Přenášené datové typy a validace}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{<name>} --- jméno hráče, neprázdné, bez whitespace, délka \(\le 63\) znaků (server má \texttt{MAX\_NAME\_LEN=64}).
+  \item \texttt{<lobby>} --- číslo lobby (1..N); pro reconnect je povoleno \texttt{0} jako „neznámé“ (pokud není hráč ve hře, klient se vrátí do lobby listu).
+  \item \texttt{<n>} --- počet lobby ve snapshotu (kladné celé číslo).
+  \item \texttt{<pairs>} --- řetězec délky \(\texttt{2*n}\) tvořený číslicemi; dvojice \texttt{players} (0..2) a \texttt{status} (0/1).
+  \item \texttt{<card>} --- karta jako dvouznakový kód \texttt{[A23456789TJQK][CDHS]} (např. \texttt{AS}, \texttt{7H}).
+  \item \texttt{<sec>} --- sekundy (timeout tahu, timeout reconnectu).
+  \item \texttt{<score>} --- celé číslo; \(-1\) znamená bust, jinak typicky 0..21.
+\end{itemize}
+
+\subsection{Omezení délky zpráv a důsledky pro návrh}
+Server čte řádky do bufferu \texttt{READ\_BUF=256}; klient proto nesmí posílat extrémně dlouhé řádky (jinak hrozí \texttt{C45WRONG} / disconnect).
+
+\subsection{Přehled zpráv}
+\label{sec:protocol-messages}
+
+Všechny zprávy jsou textové řádky zakončené \texttt{\textbackslash n}.
+
+\subsubsection{Zprávy klient \(\to\) server}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{C45<name>} --- handshake (registrace jména).
+  \item \texttt{C45REC <name> <lobby>} --- reconnect/resume session.
+  \item \texttt{C45J <lobby>} --- join lobby.
+  \item \texttt{C45B} --- „Back“ (návrat do lobby listu / refresh snapshotu; ve hře forfeit).
+  \item \texttt{C45H} --- HIT (jen ve svém tahu).
+  \item \texttt{C45S} --- STAND (jen ve svém tahu).
+  \item \texttt{C45PO} --- odpověď na PING (\texttt{C45PI}).
+\end{itemize}
+
+\subsubsection{Zprávy server \(\to\) klient}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{C45OK} --- obecné potvrzení.
+  \item \texttt{C45L <n> <pairs>} --- snapshot lobby listu (kompaktní 1 řádek).
+  \item \texttt{C45REC\_OK} --- reconnect akceptován.
+  \item \texttt{C45WRONG [detail]} --- chyba protokolu / nevalidní požadavek.
+  \item \texttt{C45DOWN [reason]} --- server se vypíná; klient má ukončit spojení.
+  \item \texttt{C45D <c1> <c2>} --- počáteční dvě karty.
+  \item \texttt{C45C <card>} --- hráč si dobral kartu.
+  \item \texttt{C45T <name> <sec>} --- kdo je na tahu a timeout v sekundách.
+  \item \texttt{C45B <name> <value>} --- bust (hráč překročil 21).
+  \item \texttt{C45TO} --- timeout lokálního hráče (auto-stand).
+  \item \texttt{C45OD <name> <sec>} --- oponent se odpojil, server čeká \texttt{sec}.
+  \item \texttt{C45OB <name>} --- oponent se vrátil, hra pokračuje.
+  \item \texttt{C45R <p1> <s1> <p2> <s2> <winner>} --- výsledek hry (\texttt{winner} může být \texttt{PUSH}).
+\end{itemize}
+
+\subsubsection{Keep-alive}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{C45PI} --- PING (obousměrně).
+  \item \texttt{C45PO} --- PONG (obousměrně).
+\end{itemize}
+
+\subsection{Poznámky}
+Token \texttt{C45B} má dva významy: klient \(\to\) server \texttt{C45B} = „Back“, server \(\to\) klient \texttt{C45B <name> <value>} = bust (rozliší se směrem a parametry).
+
+\subsection{Sekvenční scénáře}
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Connect + handshake:} TCP connect, klient pošle \texttt{C45<name>}, server odpoví \texttt{C45OK} a pošle \texttt{C45L}.
+  \item \textbf{Lobby:} klient pošle \texttt{C45J <lobby>}; po úspěchu přijde \texttt{C45OK}. Klient může poslat \texttt{C45B} pro refresh \texttt{C45L}.
+  \item \textbf{Game:} server pošle \texttt{C45D}, pak opakovaně \texttt{C45T}. Klient v tahu posílá \texttt{C45H} nebo \texttt{C45S}. Server posílá \texttt{C45C}, případně \texttt{C45B <name> <value>} a nakonec \texttt{C45R}.
+  \item \textbf{Disconnect + reconnect:} při výpadku server pošle druhému hráči \texttt{C45OD}. Odpojený hráč se vrací přes \texttt{C45REC <name> <lobby>} a server odpoví \texttt{C45REC\_OK} a obnoví hru (snapshot ruky).
+  \item \textbf{Back po hře:} po \texttt{C45R} klient odešle \texttt{C45B} a server pošle nový \texttt{C45L}.
+\end{itemize}
+
+\subsection{Relační diagram komunikace}
+Ukazuje hlavní zprávy mezi klientem a serverem a typické stavy obou stran.
+\begin{lstlisting}
+Legenda:
+  C->S  klient posila na server
+  S->C  server posila na klienta
+  [C:...] a [S:...] jsou zjednodusene stavy
+
+1) CONNECT + HANDSHAKE + LOBBY LIST
+  [C:DISCONNECTED] TCP connect
+  [S:LISTEN] accept -> [S:HANDSHAKE]
+  C->S: C45<name>
+  S->C: C45OK
+  S->C: C45L <n> <pairs>
+  [C:LOBBY_CHOICE]    [S:LOBBY_SELECT]
+
+2) JOIN LOBBY
+  C->S: C45J <lobby>
+  S->C: C45OK
+  [C:WAIT_START]      [S:WAIT_FOR_GAME]
+
+3) GAME (zjednodusene)
+  S->C: C45D <c1> <c2>
+  opakovane:
+    S->C: C45T <name> <sec>
+    pokud jsem na tahu:
+      C->S: C45H | C45S
+      S->C: C45C <card>        (po HIT)
+      S->C: C45TO              (kdyz vyprsi cas)
+      S->C: C45B <name> <val>  (bust)
+  konec hry:
+    S->C: C45R <p1> <s1> <p2> <s2> <winner>
+
+4) DISCONNECT + RECONNECT (behem hry)
+  pokud klient vypadne:
+    S->oponent: C45OD <name> <sec>
+    [C:RECONNECTING] nove TCP spojeni
+    C->S: C45REC <name> <lobby>
+    S->C: C45REC_OK
+    S->C: snapshot ruky (C45D + 0..N * C45C) nebo C45L ...
+
+5) KEEP-ALIVE (v libovolnem stavu)
+  C<->S: C45PI / C45PO
+\end{lstlisting}
+
+\section{Chybové stavy a jejich hlášení}
+\label{sec:errors}
+
+\subsection{Protokolové chyby (\texttt{C45WRONG...})}
+Server posílá \texttt{C45WRONG} typicky při:
+\begin{itemize}[topsep=0.25em]
+  \item Neplatném formátu zprávy (neznámý token, chybějící parametry).
+  \item Neplatném lobby čísle nebo akci v nesprávné fázi.
+  \item Neplatném reconnect requestu.
+\end{itemize}
+
+Chování po chybě závisí na fázi:
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Handshake / reconnect:} server ukončí spojení (nepřijatelný klient).
+  \item \textbf{Lobby select:} server může poslat \texttt{C45WRONG} a zůstat připojený (uživatel může zadat jiné lobby).
+  \item \textbf{Po skončení hry:} neznámé zprávy jsou považovány za chybu a spojení je ukončeno.
+\end{itemize}
+
+\subsection{Kolize jmen (\texttt{C45WRONG NAME\_TAKEN})}
+Jméno hráče je unikátní napříč aktivními spojeními. Pokud hráč zvolí jméno, které je již rezervované, server odpoví:
+\begin{lstlisting}[language=C45proto]
+C45WRONG NAME_TAKEN
+\end{lstlisting}
+Klient tuto situaci zobrazí uživateli a ukončí session (nový connect je nutný s jiným jménem).
+
+\subsection{Server shutdown (\texttt{C45DOWN})}
+Pokud se server vypíná (např. SIGINT nebo ztráta bind IP), pošle všem připojeným klientům:
+\begin{lstlisting}[language=C45proto]
+C45DOWN [reason]
+\end{lstlisting}
+Klient má ukončit spojení a přejít na úvodní obrazovku.
+
+\section{Implementace serveru (programátorská dokumentace)}
+\label{sec:server-impl}
+
+\subsection{Moduly a odpovědnosti}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{src/main.c} --- načte \texttt{config.txt}, zpracuje CLI volby, inicializuje lobbyny a spustí server.
+  \item \texttt{src/server.c} --- accept-loop, jedno vlákno na klienta, handshake, lobby select, koordinace s herním vláknem, registry aktivních jmen.
+  \item \texttt{src/game.c} --- logika hry, správa lobby poolu, herní vlákno pro každé lobby, reconnect během hry.
+  \item \texttt{src/protocol.c} --- robustní \texttt{read\_line}/\texttt{write\_all} a serializace snapshotu lobby (\texttt{C45L}).
+\end{itemize}
+
+\subsection{Klíčové funkce a jejich role}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{run\_server(ip,port)} --- listen socket, \texttt{poll()} na accept, kontrola dostupnosti bind IP, vytvoření per-client vláken; při konci pošle \texttt{C45DOWN}.
+  \item \texttt{client\_thread(...)} --- stavový automat klienta (handshake/reconnect, lobby, čekání, návrat po hře); toleruje \texttt{C45PI/C45PO}.
+  \item \texttt{send\_lobbies\_snapshot(fd)} --- vytvoří a odešle snapshot \texttt{C45L}.
+  \item \texttt{start\_game\_if\_ready(i)} --- spustí herní vlákno lobby po naplnění 2 hráči.
+  \item \texttt{lobby\_game\_thread(...)} --- běh hry (tahy, timeouty, reconnect, výsledky).
+  \item \texttt{read\_line()/write\_all()} --- bezpečné řádkové I/O nad TCP.
+\end{itemize}
+
+\subsection{Síť a odolnost}
+Server používá \texttt{poll()} (bez aktivního čekání) a keep-alive \texttt{C45PI/C45PO}. Při shutdownu (nebo ztrátě bind IP) informuje klienty přes \texttt{C45DOWN} a ukončí spojení.
+
+\subsection{Paralelizace}
+Server používá \textbf{vlákna} (\texttt{pthread}):
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Accept-loop} běží v hlavním vlákně a pro každého klienta spouští \texttt{client\_thread()}.
+  \item \textbf{Per-client vlákno} obsluhuje stavový automat jednoho hráče (handshake, lobby, čekání, návrat).
+  \item \textbf{Herní vlákno lobby} je spuštěno, když lobby dosáhne kapacity 2 hráčů (\texttt{start\_game\_if\_ready()}).
+\end{itemize}
+
+Synchronizace probíhá pomocí mutexů:
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{Lobby.mtx} --- chrání stav lobby (hráči, hand, fd, is\_running).
+  \item \texttt{g\_names\_mtx} --- chrání globální registry aktivních jmen a jejich tokenů.
+  \item \texttt{g\_clients\_mtx} --- seznam připojených socketů (pro rychlé odpojení všech klientů).
+\end{itemize}
+
+\subsection{Obsluha reconnectu na serveru}
+\begin{itemize}[topsep=0.25em]
+  \item Klient se vrací přes \texttt{C45REC <name> <lobby>} na novém TCP spojení.
+  \item Server odpoví \texttt{C45REC\_OK} a pokračuje buď obnovou hry (snapshot ruky), nebo návratem do lobby listu (\texttt{C45L}).
+\end{itemize}
+
+\subsection{Konfigurace serveru}
+Server čte \texttt{server/config.txt} (key-value, whitespace oddělené). Příklad:
+\begin{lstlisting}
+LOBBY_COUNT 3
+IP 0.0.0.0
+PORT 10000
+\end{lstlisting}
+
+\section{Implementace klienta}
+\label{sec:client-impl}
+
+\subsection{Rozvrstvení a třídy}
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{MainApp}:
+    \begin{itemize}[topsep=0.25em]
+      \item JavaFX entry point, vytváří scény (connect, name, lobby, waiting, game).
+      \item Vytváří instanci \texttt{NetClient} a registruje \texttt{ProtocolListener}.
+      \item Přepíná UI podle příchozích zpráv.
+    \end{itemize}
+  \item \texttt{NetClient}:
+    \begin{itemize}[topsep=0.25em]
+      \item Udržuje socket, \texttt{BufferedReader} a \texttt{OutputStream}.
+      \item Spouští daemon reader thread, který provádí blokující \texttt{readLine()}.
+      \item Implementuje parser protokolu a callbacky do \texttt{ProtocolListener}.
+      \item Implementuje keep-alive a automatický reconnect.
+    \end{itemize}
+  \item \texttt{ProtocolListener}:
+    \begin{itemize}[topsep=0.25em]
+      \item Rozhraní callbacků pro UI (OK, snapshot lobby, herní eventy, chyby, reconnect progress).
+    \end{itemize}
+  \item \texttt{GameView}:
+    \begin{itemize}[topsep=0.25em]
+      \item Herna scéna: log, skóre, tlačítka HIT/STAND, tlačítko „Back to Lobby“.
+      \item Zobrazuje reconnect status label přímo v herním okně.
+      \item Při obnově hry (snapshot ruky) nezdvojuje log karet.
+    \end{itemize}
+\end{itemize}
+
+\subsection{UI}
+Klient má obrazovky pro připojení (IP/port), zadání jména, výběr lobby a hru. Ruční \texttt{Reconnect} je dostupný až po předchozím úspěšném připojení (klient zná poslední \texttt{name} a \texttt{lobby}).
+
+\subsection{Paralelizace klienta}
+Klient používá \textbf{dvě hlavní vlákna}:
+\begin{itemize}[topsep=0.25em]
+  \item JavaFX Application Thread --- rendering UI a zpracování akcí uživatele.
+  \item Reader thread (\texttt{net-reader}) --- čte TCP stream, parsuje protokol a vyvolává callbacky.
+\end{itemize}
+Veškeré změny UI jsou prováděny pomocí \texttt{Platform.runLater(...)}.
+
+\subsection{Keep-alive a reconnect }
+\label{sec:client-reconnect}
+Klient pravidelně ověřuje, že server odpovídá (PING/PONG). Při výpadku se pokusí automaticky obnovit spojení; při úspěchu pošle \texttt{C45REC <name> <lobby>} a pokračuje ve hře nebo se vrátí do lobby listu. Pokud auto-reconnect selže, uživatel použije ruční \texttt{Reconnect}.
+
+\section{Požadavky na překlad, spuštění a běh aplikace}
+\label{sec:build-run}
+
+\subsection{Server (C)}
+\textbf{Požadavky:}
+\begin{itemize}[topsep=0.25em]
+  \item Linux/Unix-like prostředí s POSIX API
+  \item \texttt{gcc} nebo kompatibilní C11 překladač
+  \item \texttt{make}
+\end{itemize}
+
+\textbf{Postup překladu:}
+\begin{lstlisting}[language=bash]
+cd server
+make -j
+\end{lstlisting}
+
+\textbf{Spuštění:}
+\begin{itemize}[topsep=0.25em]
+  \item výchozí: server čte \texttt{config.txt} v aktuální složce,
+  \item volitelně lze zadat IP a port přes CLI: \texttt{-i <IP> -p <PORT>}.
+\end{itemize}
+\begin{lstlisting}[language=bash]
+./blackjack_server -i 0.0.0.0 -p 10000
+\end{lstlisting}
+
+\subsubsection{Konfigurace serveru (\texttt{config.txt})}
+Konfigurační soubor je textový, každá položka je ve formátu \texttt{KEY VALUE} (oddělené whitespace). Podporované klíče:
+\begin{itemize}[topsep=0.25em]
+  \item \texttt{LOBBY\_COUNT} --- počet lobby (1--99),
+  \item \texttt{IP} --- bind adresa (např. \texttt{0.0.0.0} nebo \texttt{127.0.0.1}),
+  \item \texttt{PORT} --- port (1..65535).
+\end{itemize}
+
+\subsubsection{Logování}
+Server vypisuje stavové informace na standardní výstup (\texttt{stdout}): připojení klientů, protokolové chyby, start/stop hry a informace o odpojení/reconnectu.
+
+\subsection{Klient (JavaFX)}
+\textbf{Požadavky:}
+\begin{itemize}[topsep=0.25em]
+  \item Java JDK 17
+  \item Maven
+\end{itemize}
+
+\textbf{Postup překladu/spuštění:}
+\begin{lstlisting}[language=bash]
+cd clientBlackJack/client
+mvn clean javafx:run
+\end{lstlisting}
+
+\subsubsection{Poznámky k běhu JavaFX}
+Spuštění přes \texttt{mvn javafx:run} automaticky nastaví potřebné JavaFX moduly a knihovny. V případě ručního spouštění mimo Maven je potřeba správně nastavit \texttt{--module-path} a \texttt{--add-modules} pro JavaFX (nebo vytvořit bundlovanou distribuci).
+
+\textbf{Běh aplikace:}
+\begin{itemize}[topsep=0.25em]
+  \item Uživatel zadá IP a port serveru.
+  \item Zadá jméno (bez mezer).
+  \item Zobrazí se lobby list, uživatel zvolí lobby číslo.
+  \item Po startu hry se zobrazí herní okno.
+\end{itemize}
+
+\subsubsection{Ruční reconnect (uživatelský postup)}
+Pokud automatický reconnect selže a aplikace zobrazí hlášku „Please reconnect manually“, uživatel může:
+\begin{itemize}[topsep=0.25em]
+  \item přejít na úvodní obrazovku (Connect),
+  \item zadat IP/port,
+  \item použít tlačítko \textbf{Reconnect} (je dostupné pouze pokud klient zná poslední \texttt{name} a \texttt{lobby}).
+\end{itemize}
+Tlačítko odešle \texttt{C45REC <name> <lobby>} a klient pokračuje v čekání na obnovení hry nebo na lobby snapshot.
+
+\section{Ukázky komunikace}
+\subsection{Handshake a lobby snapshot}
+\begin{lstlisting}[language=C45proto]
+# Client -> Server
+C45Alice
+
+# Server -> Client
+C45OK
+C45L 3 000000
+\end{lstlisting}
+
+\subsection{Join lobby a start hry}
+\begin{lstlisting}[language=C45proto]
+# Client -> Server
+C45J 1
+
+# Server -> Client
+C45OK
+
+# pozdeji, kdyz jsou v lobby 2 hraci:
+C45D AS 5S
+C45T Alice 60
+\end{lstlisting}
+
+\subsection{Reconnect během hry}
+\begin{lstlisting}[language=C45proto]
+# Client -> Server (nove TCP spojeni)
+C45REC Alice 1
+
+# Server -> Client
+C45REC_OK
+
+# snapshot ruky (minimalne prvni 2 karty)
+C45D AS 5S
+C45C 3H
+
+# pokracovani hry
+C45T Bob 60
+\end{lstlisting}
+
+\subsection{Poznámky}
+\begin{itemize}[topsep=0.25em]
+  \item Typické chyby serveru: \texttt{C45WRONG} (nevalidní požadavek), \texttt{C45WRONG NAME\_TAKEN} (kolize jmen), \texttt{C45DOWN} (server se vypíná).
+  \item Důležité timeouty: tah hráče je standardně 60 s (\texttt{TURN\_TIMEOUT\_SEC}), server čeká na reconnect ve hře 60 s (\texttt{RECONNECT\_TIMEOUT\_SEC}).
+\end{itemize}
+
+\section{Závěr a zhodnocení dosažených výsledků}
+
+Byla úspěšně implementována síťová hra Blackjack ve variantě 1 vs. 1, která je rozdělena na serverovou část v jazyce C a klientskou část v Javě (JavaFX). Cílem bylo vytvořit funkční klient/server řešení s vlastním protokolem a současně zajistit použitelnost i při běžných síťových problémech (zpoždění, fragmentace, výpadek spojení).
+
+\subsection{Zhodnocení protokolu}
+Zvolený protokol je záměrně jednoduchý: textové řádky přes TCP, tokeny s prefixem \texttt{C45} a parametry oddělené whitespace. Tento přístup má výhody v laditelnosti (lze testovat přes \texttt{nc}) a v možnosti snadno vytvořit alternativního klienta/server.
+Součástí protokolu jsou:
+\begin{itemize}[topsep=0.25em]
+  \item handshake a lobby snapshot (\texttt{C45OK}, \texttt{C45L}),
+  \item průběh hry (deal/turn/card/bust/timeout/result),
+  \item keep-alive (\texttt{C45PI/C45PO}) pro rychlejší detekci „tichých“ výpadků,
+  \item reconnect (\texttt{C45REC}, \texttt{C45REC\_OK}) pro navázání na běžící session.
+\end{itemize}
+
+\subsection{Zhodnocení implementace}
+Server používá POSIX API (sockety, \texttt{poll()}, \texttt{pthread}) a běží jako vícevláknová aplikace: jedno vlákno na klienta a herní vlákno pro lobby, jakmile jsou připojeni dva hráči. Klient používá JavaFX pro UI a samostatné „reader“ vlákno pro blokující čtení ze socketu; změny UI jsou prováděny přes \texttt{Platform.runLater}.
+
+\subsection{Omezení a možnosti zlepšení}
+V aktuální verzi jsou nejdůležitější omezení a možné další kroky:
+\begin{itemize}[topsep=0.25em]
+  \item \textbf{Škálování lobby listu:} lobby snapshot \texttt{C45L} je jednorázová zpráva; pro tisíce lobby je vhodnější stránkování (více zpráv) nebo jiný formát.
+  \item \textbf{Bezpečnost:} protokol je bez autentizace a šifrování (TLS); je vhodný pro LAN/testování, ne pro veřejné nasazení.
+  \item \textbf{Herní rozšíření:} přidání dealera, více hráčů, botů nebo statistik by vyžadovalo rozšíření protokolu i UI.
+  \item \textbf{Testování:} přidání automatizovaných integračních testů by zlepšilo jistotu při úpravách (např. testy reconnectu a chybových stavů).
+\end{itemize}
+
+\end{document}

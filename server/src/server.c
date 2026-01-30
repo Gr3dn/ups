@@ -155,8 +155,6 @@ static void client_fd_remove(int fd) {
 }
 
 /**
- * Best-effort notify all connected clients about server shutdown and disconnect them.
- *
  * This is used when the server is stopping (SIGINT) or when it detects that its
  * bind address is no longer available (network/interface changes).
  *
@@ -194,8 +192,6 @@ static void server_notify_and_disconnect_all(const char* reason) {
  * unreachable because the configured bind address disappeared (e.g. Wi‑Fi off,
  * VPN/WSL IP change).
  *
- * For "localhost" this check is skipped.
- *
  * For "0.0.0.0" (INADDR_ANY) we consider "network is gone" to be "no non-loopback IPv4
  * interface is UP". Use "localhost" for a local-only server.
  *
@@ -206,7 +202,7 @@ static int is_bind_ip_available(const char* bind_ip) {
     struct ifaddrs* ifaddr = NULL;
 
     if (!bind_ip || strcmp(bind_ip, "0.0.0.0") == 0) {
-        if (getifaddrs(&ifaddr) != 0) return 1; // best-effort: assume OK if we can't query
+        if (getifaddrs(&ifaddr) != 0) return 1;
         int ok = 0;
         for (struct ifaddrs* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
             if (!ifa->ifa_addr) continue;
@@ -309,7 +305,6 @@ int active_name_add(const char* n) {
 void active_name_remove(const char* n) {
     for (int i = 0; i < g_active_cnt; ++i) {
         if (strncmp(g_active_names[i], n, MAX_NAME_LEN) == 0) {
-            // compact
             if (i != g_active_cnt - 1) {
                 memcpy(g_active_names[i], g_active_names[g_active_cnt-1], MAX_NAME_LEN);
                 g_active_fds[i] = g_active_fds[g_active_cnt-1];
@@ -545,7 +540,7 @@ static int parse_name_only(const char* line, char* out_name, int out_name_sz) {
     }
     if (tmp[0] == '\0') return -2;
     for (int i = 0; tmp[i]; ++i) {
-        if (isspace((unsigned char)tmp[i])) return -4; // protocol uses whitespace delimiters
+        if (isspace((unsigned char)tmp[i])) return -4;
     }
     if ((int)strlen(tmp) >= out_name_sz) return -3;
 
@@ -628,7 +623,7 @@ static void* client_thread(void* arg) {
         }
         if (is_token(line, "C45PO")) continue;
 
-        break; // real handshake line
+        break;
     }
 
     // Reconnect path: first line is "C45REC <name> <lobby>\n"
@@ -650,7 +645,7 @@ static void* client_thread(void* arg) {
             // Small grace period: the client may reconnect slightly faster than the game thread
             // marks its old fd as disconnected (fd == -1). Wait briefly to avoid false failures.
             const int wait_us_step = 50000;   // 50ms
-            const int wait_us_total = 3200000; // 3.2s (must stay below client handshake timeout)
+            const int wait_us_total = 3200000; // 3.2s
             for (int waited = 0; waited <= wait_us_total; waited += wait_us_step) {
                 if (lobby_try_reconnect(li, name, cfd) == 0) {
                     reconnected = 1;

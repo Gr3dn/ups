@@ -137,8 +137,8 @@ int load_config(const char* filename) {
 
         if (strcmp(key, "LOBBY_COUNT") == 0) {
             int v = atoi(val);
-            if (v >= 1 && v <= 1000) g_lobby_count = v;
-            else printf("Lobby_Count cannot be over 1000. Used default value 5\n\n");
+            if (v >= 1 && v < 100) g_lobby_count = v;
+            else printf("Lobby_Count cannot be over 100. Used default value 5\n\n");
         } else if (strcmp(key, "PORT") == 0) {
             int p = atoi(val);
             if (p >= 1 && p <= 65535) g_server_port = p;
@@ -348,10 +348,6 @@ static void player_disconnect_fd(Lobby* L, int player_index) {
     old_fd = L->players[player_index].fd;
     L->players[player_index].fd = -1;
     pthread_mutex_unlock(&L->mtx);
-    // Do not close() here: the per-client network thread owns the lifetime of the fd.
-    // Closing from the game thread can race with reconnects and fd reuse, causing the
-    // new connection to be closed or consumed by a stale thread. shutdown() is enough
-    // to unblock any pending I/O and mark the connection as dead.
     if (old_fd >= 0) (void)shutdown(old_fd, SHUT_RDWR);
 }
 
@@ -686,7 +682,7 @@ static void* lobby_game_thread(void* arg) {
 
 	            if (pfd < 0) goto pause_turn;
 
-		            // If the other player disconnects during this turn, pause immediately and wait for reconnect.
+		            // If the other player disconnects during this turn, pause and wait for reconnect.
 		            if (other_fd >= 0) {
 		                struct pollfd op = { .fd = other_fd, .events = POLLIN | POLLHUP | POLLERR };
 		                int pr = poll(&op, 1, 0);
@@ -729,7 +725,6 @@ static void* lobby_game_thread(void* arg) {
 			                last_pong = now;
 			                continue;
 			            } else if (is_token(buf, "C45YES")) {
-			                // Can arrive late from the lobby waiting phase; ignore.
 			                continue;
 		            } else if (is_back_request_for_name(buf, L->players[turn].name) == 1) {
 	                active_name_mark_back(L->players[turn].name, pfd);

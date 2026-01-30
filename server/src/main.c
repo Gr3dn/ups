@@ -112,7 +112,6 @@ typedef struct {
  *
  * Supported forms:
  *   - "-i IP -p PORT"
- *   - legacy positional port: "./blackjack_server 10000"
  *
  * @param argc CLI argc.
  * @param argv CLI argv.
@@ -141,12 +140,6 @@ static int parse_cli_net(int argc, char** argv, CliNet* out) {
             continue;
         }
 
-        if (strcmp(a, "-help") == 0 || strcmp(a, "--help") == 0) {
-            // handled before load_config()
-            continue;
-        }
-
-        // Backward-compat positional arg (legacy): ./blackjack_server 10000
         // Treated as incomplete CLI net config (we require both -i and -p).
         if (argc == 2 && a[0] != '-') {
             out->requested = 1;
@@ -228,7 +221,6 @@ static void parse_config_net(const char* filename, ConfigNet* out) {
  * @return Process exit code.
  */
 int main(int argc, char** argv) {
-    // Help must not depend on config.txt (and should not start the server).
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0) {
             print_help(argv[0]);

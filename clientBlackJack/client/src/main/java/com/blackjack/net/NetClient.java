@@ -768,49 +768,4 @@ public class NetClient {
             throw new ProtocolException("Bad " + ctx + ": " + s);
         }
     }
-
-    /* --- C45 framed messages (optional) --- */
-
-    /**
-     * Build a framed C45 line: {@code C45LL<payload>\n}.
-     *
-     * @param payload Payload string (NULL is treated as empty).
-     * @return Full frame line.
-     */
-    private static String buildC45Frame(String payload) {
-        if (payload == null) payload = "";
-        int len = payload.length();
-        if (len > 99) throw new IllegalArgumentException("C45 payload too long: " + len);
-        return String.format("C45%02d%s\n", len, payload);
-    }
-
-    /**
-     * Try to parse a framed C45 line and return its payload.
-     *
-     * @param line Raw line (without trailing newline).
-     * @return Payload string if this is a valid frame; null if not a C45 frame.
-     */
-    private static String tryParseC45Frame(String line) throws IOException {
-        if (line == null || !line.startsWith("C45")) return null;
-        if (line.length() < 5) throw new IOException("Bad C45 frame: too short");
-        char a = line.charAt(3), b = line.charAt(4);
-        if (!Character.isDigit(a) || !Character.isDigit(b)) throw new IOException("Bad C45 length digits");
-        int len = (a - '0') * 10 + (b - '0');
-        if (len < 0 || len > 99) throw new IOException("C45 length out of range");
-        String payload = line.substring(5);
-        if (payload.length() != len) throw new IOException("C45 length mismatch");
-        return payload;
-    }
-
-    /**
-     * Compatibility helper: convert a payload into the legacy token form ("C45" + payload).
-     *
-     * @param maybePayloadOrNull Parsed payload (or null).
-     * @return Legacy token string (or null).
-     */
-    private static String coerceToLegacyToken(String maybePayloadOrNull) {
-        if (maybePayloadOrNull == null) return null;
-        return "C45" + maybePayloadOrNull;
-    }
-
 }

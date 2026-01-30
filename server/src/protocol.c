@@ -5,7 +5,6 @@
  *   Implementation of low-level line I/O and protocol helpers used by the server:
  *   - Safe "write all" for TCP sockets.
  *   - Line-oriented reads (blocking and timed).
- *   - C45 framed-message helpers.
  *   - Lobby snapshot serialization.
  *
  * Table of contents:
@@ -13,7 +12,6 @@
  *   - read_line(), read_line_timeout()
  *   - is_c45_prefix()
  *   - send_lobbies_snapshot()
- *   - C45 framing: c45_parse_line(), c45_build_frame(), send_c45(), read_c45()
  */
 
 #include "protocol.h"
@@ -173,96 +171,4 @@ int read_line_timeout(int fd, char* buf, size_t sz, int t) {
     }
     buf[pos] = '\0';
     return (int)pos;
-}
-
-/**
- * Parse a C45 framed line into a payload buffer.
- *
- * @param line   NUL-terminated input line.
- * @param out    Destination payload buffer.
- * @param out_sz Size of @p out in bytes.
- *
- * @return  1  Parsed successfully.
- * @return  0  Not a C45 frame.
- * @return -2  Invalid length digits or length mismatch.
- * @return -3  Output buffer too small.
- */
-int c45_parse_line(const char* line, char* out, size_t out_sz) {
-    if (!line) return 0;
-    if (strncmp(line, "C45", 3) != 0) return 0;
-    if (line[3] < '0' || line[3] > '9' || line[4] < '0' || line[4] > '9') {
-        return -2;
-    }
-
-
-    int len = (line[3]-'0')*10 + (line[4]-'0');
-    if (len < 0 || len > C45_MAX_PAYLOAD) return -2;
-
-    const char* payload = line + 5;
-    int actual = (int)strlen(payload);
-    if (actual != len) return -2;
-    if ((size_t)(len+1) > out_sz) return -3;
-
-    memcpy(out, payload, (size_t)len);
-    out[len] = '\0';
-    return 1;
-}
-
-/**
- * Build a C45 framed line from a payload.
- *
- * @param payload NUL-terminated payload string (NULL treated as empty string).
- * @param out     Destination buffer for the resulting frame.
- * @param out_sz  Size of @p out in bytes.
- *
- * @return 0 on success; -1 on error.
- */
-int c45_build_frame(const char* payload, char* out, size_t out_sz) {
-    if (!payload) payload = "";
-    int len = (int)strlen(payload);
-    if (len < 0 || len > C45_MAX_PAYLOAD) return -1;
-    // "C45" + 2 lenDig + payload + "\n" + '\0'
-    size_t need = 3 + 2 + (size_t)len + 1 + 1;
-    if (out_sz < need) return -1;
-    snprintf(out, out_sz, "C45%02d%s\n", len, payload);
-    return 0;
-}
-
-/**
- * Send a payload as a C45 framed line.
- *
- * @param fd      Connected socket file descriptor.
- * @param payload Payload string.
- *
- * @return 0 on success; -1 on error.
- */
-int send_c45(int fd, const char* payload) {
-    char buf[3 + 2 + C45_MAX_PAYLOAD + 2]; // "C45" + len + payload + "\n\0"
-    if (c45_build_frame(payload, buf, sizeof(buf)) != 0) return -1;
-    return write_all(fd, buf) < 0 ? -1 : 0;
-}
-
-/**
- * Read a line from a socket and decode it as a C45 frame.
- *
- * @param fd          Connected socket file descriptor.
- * @param out_payload Destination buffer for payload.
- * @param out_sz      Size of @p out_payload in bytes.
- *
- * @return >0   Payload length.
- * @return  0   EOF (peer closed).
- * @return -100 Not a C45 frame.
- * @return -101 Length error.
- * @return -1   Other I/O error.
- */
-int read_c45(int fd, char* out_payload, size_t out_sz) {
-    char line[READ_BUF];
-    int r = read_line(fd, line, sizeof(line));
-    if (r == 0) return 0;
-    if (r < 0)  return -1;
-    int pr = c45_parse_line(line, out_payload, out_sz);
-    if (pr == 1) return (int)strlen(out_payload);
-    if (pr == 0)  return -100;
-    if (pr == -2) return -101;
-    return -1;
 }
